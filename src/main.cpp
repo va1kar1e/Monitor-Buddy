@@ -1,5 +1,6 @@
 // ============================================================
 // Monitor-Buddy — Waveshare ESP32-C6-Touch-LCD-1.47
+//                 and ESP32-S3-Touch-LCD-1.47 (see lib/board/board_pins.h)
 // by IdefixRC - https://github.com/IdefixRC
 // Features: animated faces, clock, date, weather, moon,
 //           stock ticker, GitHub stats.  
@@ -9,7 +10,9 @@
 //           double tap to stop auto scrolling;
 //           WifiManager creates a Wi-Fi hotspot with a
 //           captive portal so you can set your Wi-Fi up;
-//           tilt via QMI8658 IMU animates eyes.
+//           tilt via QMI8658 IMU animates eyes (ESP32-C6 board;
+//           the ESP32-S3 board has no motion sensor, so its eyes
+//           use the animated fallback motion).
 //
 // ------------------------------------------------------------
 // ACKNOWLEDGEMENTS
@@ -51,7 +54,8 @@
 //  ~2.5 s. Works from any page, at any time.
 //
 //  Hardware fallback: within 2 s of the screen showing CONNECTING
-//  (or WIFI SETUP), press and hold the BOOT button (GPIO9): 2–5 s
+//  (or WIFI SETUP), press and hold the BOOT button (GPIO9 on the
+//  C6 board, GPIO0 on the S3 board): 2–5 s
 //  opens the portal, >= 5 s erases the stored Wi-Fi (only
 //  /wifi.json) and reboots. BOOT is not read once the Buddy runs.
 //  (Do NOT hold BOOT *through* reset — that enters USB download
@@ -102,6 +106,7 @@
 #include "settings.h"
 #include "protocol.h"
 #include "display_fmt.h"
+#include "board_pins.h"   // which Waveshare board this is, and its pins (lib/board)
 
 // Set from the release tag by the release workflow (-DFW_VERSION=\"1.2.0\").
 #ifndef FW_VERSION
@@ -160,25 +165,12 @@
 
 // ── AWM GPIO assignment — DO NOT USE THE LIBRARY DEFAULTS ──
 // AyresWiFiManager's constructor defaults are ledPin = 2 and
-// buttonPin = 0. On this board GPIO2 is LCD_MOSI and GPIO1 is
+// buttonPin = 0. On the ESP32-C6 board GPIO2 is LCD_MOSI and GPIO1 is
 // LCD_SCK: AWM's begin() calls pinMode(ledPin, OUTPUT) and
 // digitalWrite(ledPin, LOW), which would clamp the SPI data line
-// and blank the display. The pins below are passed explicitly to
-// the constructor to avoid that.
-//
-// Pins already taken on the ESP32-C6-Touch-LCD-1.47:
-//   1, 2, 14, 15, 22, 23  → LCD SPI / DC / CS / RST / backlight
-//   18, 19, 20, 21        → touch I2C / RST / INT
-//   5, 6                  → QMI8658 IMU interrupts
-//   8                     → boot-mode strapping + onboard RGB LED
-//   9                     → BOOT button
-//   12, 13                → USB-Serial-JTAG
-// GPIO3 is free, broken out, and is not a strapping pin, so it is
-// used as a harmless "status LED" sink. Nothing is wired to it —
-// AWM just toggles it. If you solder an LED to another free pin,
-// change AWM_LED_PIN to match.
-#define AWM_LED_PIN     3   // dummy/optional status LED — must NOT be an LCD or touch pin
-#define AWM_BUTTON_PIN  9   // onboard BOOT button, active LOW
+// and blank the display. AWM_LED_PIN and AWM_BUTTON_PIN (the BOOT
+// button) come from lib/board/board_pins.h, with the rest of each
+// board's pins, and are passed explicitly to the constructor to avoid that.
 
 // Wi-Fi retry behaviour once we are running.
 // AWM runs the reconnect in the background, so neither value blocks the UI.
@@ -222,17 +214,8 @@ static constexpr UBaseType_t NET_TASK_PRIORITY    = 1;     // same as loop()
 static constexpr uint32_t    NET_HEALTH_LOG_MS    = 5UL * 60UL * 1000UL;
 
 // ── Pin definitions ────────────────────────────────────────
-#define LCD_BL    23
-#define LCD_DC    15
-#define LCD_CS    14
-#define LCD_SCK    1
-#define LCD_MOSI   2
-#define LCD_RST   22
-
-#define TOUCH_SDA 18
-#define TOUCH_SCL 19
-#define TOUCH_RST 20
-#define TOUCH_INT 21
+// LCD_*, TOUCH_*, AWM_LED_PIN, AWM_BUTTON_PIN, BOARD_NAME and BOARD_HAS_IMU
+// come from lib/board/board_pins.h.
 
 
 struct AccelData {
@@ -458,7 +441,8 @@ class QMI8658Mini {
 
 // ── AXS5106L inline touch reader ──────────────────────────
 // The AXS5106L is the capacitive touch controller on the
-// Waveshare ESP32-C6-Touch-LCD-1.47. ESP-IDF components exist,
+// Waveshare ESP32-C6-Touch-LCD-1.47 and ESP32-S3-Touch-LCD-1.47 (the same
+// 1.47" module on both boards). ESP-IDF components exist,
 // but this Arduino starter inlines a small polling reader so it
 // does not need the ESP-IDF/LVGL touch stack.
 // Protocol: I2C @ 400 kHz, 7-bit device address 0x63.
@@ -2480,7 +2464,7 @@ void setup() {
   // is simply dropped.
   Serial.setTxTimeoutMs(0);
   delay(150);
-  Serial.println("ESP32-C6 Monitor-Buddy " FW_VERSION " starting");
+  Serial.println(BOARD_NAME " Monitor-Buddy " FW_VERSION " starting");
   netMutex = xSemaphoreCreateMutex();
   if (!netMutex) Serial.println("ERROR: no memory for netMutex - network pages disabled");
 
@@ -2508,11 +2492,15 @@ void setup() {
   touchReady = true;
   Serial.println("Touch controller initialised");
 
+#if BOARD_HAS_IMU
   int err = imu.init(calib, IMU_ADDRESS);
   if (err == 0) {
     imuReady = (imu.setAccelRange(4)==0 && imu.setGyroRange(512)==0);
     if (imuReady) calibrateNeutral();
   }
+#endif
+  // A board without the motion sensor never probes it: the failed I2C reads
+  // would only reset the touch bus for nothing.
   if (!imuReady) Serial.println("IMU unavailable — using animated fallback motion");
 
   randomSeed(micros());
