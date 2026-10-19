@@ -54,6 +54,20 @@ def summary(body):
     return "   ".join(parts)
 
 
+def limit_text(t):
+    """'Limit 42%  Week 17%  resets in 2 h 14 m' from a body entry, '' without limits."""
+    parts = []
+    if t.get("pct1") is not None:
+        parts.append(f"Limit {t['pct1']}%")
+    if t.get("pct2") is not None:
+        parts.append(f"Week {t['pct2']}%")
+    if t.get("reset1") is not None:
+        m = t["reset1"]
+        parts.append("resets in " + (f"{m} m" if m < 60 else f"{m // 60} h {m % 60} m" if m < 1440
+                                     else f"{m // 1440} d {m % 1440 // 60} h"))
+    return "  ".join(parts)
+
+
 def list_ports():
     """[(device, label, looks_like_a_buddy)]; empty when pyserial is missing."""
     try:
@@ -118,13 +132,18 @@ class Controller:
         with self.lock:
             return self._send({"state": state}, "STATUS", "/status")
 
+    def read_usage(self):
+        """The usage found in the local Claude Code and Codex logs; sends nothing,
+        so it works with no Buddy connected."""
+        return up.build_body(None, dt.date.today(), Path("~/.claude/projects").expanduser(),
+                             Path("~/.codex/sessions").expanduser())
+
     def send_usage(self):
         """(ok, message, body)."""
+        body = self.read_usage()
         problem = self.target_problem()
         if problem:
-            return False, problem, {}
-        body = up.build_body(None, dt.date.today(), Path("~/.claude/projects").expanduser(),
-                             Path("~/.codex/sessions").expanduser())
+            return False, problem, body
         with self.lock:
             ok, msg = self._send(body, "USAGE", "/usage")
         return ok, msg, body
@@ -139,10 +158,11 @@ class App:
         self.buttons = {}
         self.port_map = {}           # combobox label -> device
         root.title("Monitor Buddy")
-        root.minsize(440, 520)
+        root.minsize(460, 640)
         self.build()
         self.refresh_ports()
         self.root.after(150, self.drain)
+        self.refresh_usage()
         if self.ctl.settings["auto_usage"]:
             self.root.after(500, self.usage_tick)
 
@@ -205,8 +225,31 @@ class App:
         spin.bind("<FocusOut>", lambda e: self.on_interval())
         ttk.Label(us, text="seconds").grid(row=0, column=2, sticky="w")
         ttk.Button(us, text="Send now", command=self.send_usage_now).grid(row=0, column=3, padx=(16, 0))
-        self.usage_line = ttk.Label(us, text="Nothing sent yet.", wraplength=380)
-        self.usage_line.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        table = tk.Frame(us)
+        table.grid(row=1, column=0, columnspan=4, sticky="we", pady=(10, 0))
+        for c, head in enumerate(("", "Today", "7 days")):
+            tk.Label(table, text=head, fg="#666666", font=("Helvetica", 10)).grid(row=0, column=c, sticky="w", padx=4)
+        self.cells = {}
+        for r, (name, color) in enumerate((("claude", BLUE), ("codex", GREEN)), start=1):
+            tk.Label(table, text=name.title(), fg="white", bg=color, width=8,
+                     font=("Helvetica", 11, "bold")).grid(row=r * 2 - 1, column=0, sticky="we", padx=4, pady=(4, 0))
+            for c, key in ((1, "today"), (2, "week")):
+                lab = tk.Label(table, text="-", font=("Helvetica", 12, "bold"), anchor="w")
+                lab.grid(row=r * 2 - 1, column=c, sticky="we", padx=4, pady=(4, 0))
+                self.cells[(name, key)] = lab
+            lim = tk.Label(table, text="", fg="#666666", font=("Helvetica", 10), anchor="w")
+            lim.grid(row=r * 2, column=1, columnspan=2, sticky="we", padx=4)
+            self.cells[(name, "limit")] = lim
+        table.columnconfigure(1, weight=1)
+        table.columnconfigure(2, weight=1)
+        bar = tk.Frame(us)
+        bar.grid(row=2, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        self.usage_line = ttk.Label(bar, text="Reading your logs...")
+        self.usage_line.pack(side="left")
+        ttk.Button(bar, text="Refresh", command=self.refresh_usage).pack(side="right")
+        ttk.Label(us, text="Tokens are input + output; $ is an estimate at API list prices.",
+                  foreground="#666666").grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         # Log
         lf = ttk.LabelFrame(body, text="Log", padding=6)
@@ -272,6 +315,20 @@ class App:
         ok, msg = self.ctl.send_status(key)
         self.events.put(("status", key, ok, msg))
 
+    def refresh_usage(self):
+        """Reads the logs again and shows them; sends nothing."""
+        threading.Thread(target=lambda: self.events.put(("read", self.ctl.read_usage())), daemon=True).start()
+
+    def show_usage(self, body):
+        for name in ("claude", "codex"):
+            t = body.get(name)
+            if not t:
+                continue
+            self.cells[(name, "today")].configure(text=f"{short_tokens(t['today'])}   ${t.get('today_usd', 0):.2f}")
+            self.cells[(name, "week")].configure(text=f"{short_tokens(t['week'])}   ${t.get('week_usd', 0):.2f}")
+            self.cells[(name, "limit")].configure(text=limit_text(t))
+        self.usage_line.configure(text=f"Read at {time.strftime('%H:%M:%S')}")
+
     def send_usage_now(self):
         problem = self.ctl.target_problem()
         if problem:
@@ -307,11 +364,13 @@ class App:
                     else:
                         self.say(f"Could not set the status: {msg}")
                     self.mark()
+                elif ev[0] == "read":
+                    self.show_usage(ev[1])
                 else:
                     _, ok, msg, body = ev
+                    self.show_usage(body)
                     if ok:
-                        self.usage_line.configure(text=f"{time.strftime('%H:%M:%S')}  {summary(body)}")
-                        self.say("Usage sent.")
+                        self.say(f"Usage sent: {summary(body)}")
                     else:
                         self.say(f"Usage not sent: {msg}")
         except queue.Empty:

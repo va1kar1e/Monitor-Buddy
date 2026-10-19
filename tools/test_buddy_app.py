@@ -29,7 +29,24 @@ class Formatting(unittest.TestCase):
         self.assertEqual(ba.summary({}), "")
 
 
+class Limits(unittest.TestCase):
+    def test_limit_text(self):
+        self.assertEqual(ba.limit_text({"pct1": 42, "pct2": 17, "reset1": 134}), "Limit 42%  Week 17%  resets in 2 h 14 m")
+        self.assertEqual(ba.limit_text({"pct2": 5}), "Week 5%")
+        self.assertEqual(ba.limit_text({"reset1": 5}), "resets in 5 m")
+        self.assertEqual(ba.limit_text({"today": 1}), "")
+
+
 class Sending(unittest.TestCase):
+    def test_read_usage_needs_no_buddy(self):
+        c = controller(mode="usb", port="")
+        with mock.patch.object(up, "build_body", return_value={"claude": {"today": 1}}):
+            self.assertEqual(c.read_usage(), {"claude": {"today": 1}})
+            ok, msg, body = c.send_usage()
+        self.assertFalse(ok)
+        self.assertIn("USB port", msg)
+        self.assertEqual(body, {"claude": {"today": 1}})   # still shown in the window
+
     def test_needs_a_target(self):
         self.assertIn("USB port", controller(mode="usb", port="").send_status("busy")[1])
         self.assertIn("Wi-Fi address", controller(mode="wifi", host=" ").send_status("busy")[1])
@@ -102,6 +119,12 @@ class Window(unittest.TestCase):
             root.withdraw()
             app = ba.App(root, controller())
             self.assertEqual(set(app.buttons), {"free", "busy", "meeting"})
+            app.show_usage({"claude": {"today": 76217, "week": 123158, "today_usd": 3.88, "week_usd": 6.24},
+                            "codex": {"today": 0, "week": 11094439, "today_usd": 0.0, "week_usd": 203.23,
+                                      "pct1": 42, "reset1": 134}})
+            self.assertEqual(app.cells[("claude", "today")].cget("text"), "76.2k   $3.88")
+            self.assertEqual(app.cells[("codex", "week")].cget("text"), "11.0M   $203.23")
+            self.assertEqual(app.cells[("codex", "limit")].cget("text"), "Limit 42%  resets in 2 h 14 m")
         finally:
             root.destroy()
 
