@@ -101,11 +101,14 @@
 #include <string.h>
 
 #include <LittleFS.h>
+#include <WebServer.h>
+#include <Preferences.h>
 #include <AyresWiFiManager.h>
 #include <esp_mac.h>
 #include "settings.h"
 #include "protocol.h"
 #include "display_fmt.h"
+#include "usage.h"       // POST /usage body and the usage pages' text (lib/usage)
 #include "board_pins.h"   // which Waveshare board this is, and its pins (lib/board)
 
 // Set from the release tag by the release workflow (-DFW_VERSION=\"1.2.0\").
@@ -293,6 +296,11 @@ void drawMoonDisc(int cx, int cy, int radius, float phase, uint16_t color);
 void drawMoon();
 void drawStock();
 void drawGithub();
+void drawUsagePage(const char *title, uint16_t accent, const UsageSlot &u);
+void drawClaude();
+void drawCodex();
+void drawStatus();
+void serviceUsageServer();
 void triggerFaceTap();
 void readSensors();
 void readTouch();
@@ -562,7 +570,7 @@ bool bsp_touch_get_coordinates(uint16_t *outX, uint16_t *outY) {
 
 static const int SCREEN_W         = 320;
 static const int SCREEN_H         = 172;
-static const uint8_t APP_COUNT    = 7;   // total number of pages defined
+static const uint8_t APP_COUNT    = 10;   // total number of pages defined
 
 // Page identifiers, in fixed display order. These index the render switch in
 // loop(); which are actually shown is decided by settings.pages.
@@ -573,6 +581,14 @@ static constexpr uint8_t PAGE_WEATHER = 3;
 static constexpr uint8_t PAGE_MOON    = 4;
 static constexpr uint8_t PAGE_STOCK   = 5;
 static constexpr uint8_t PAGE_GITHUB  = 6;
+// The two usage pages are not in settings.pages: they appear while a PC is
+// pushing usage to POST /usage (tools/usage_push.py) and vanish at reboot.
+static constexpr uint8_t PAGE_CLAUDE  = 7;
+static constexpr uint8_t PAGE_CODEX   = 8;
+// Free / Busy / In a meeting: always in the rotation (not in settings.pages).
+// Set from a PC (@MB STATUS, POST /status) or by tapping the page; kept in RAM
+// only, so a restart goes back to Free.
+static constexpr uint8_t PAGE_STATUS  = 9;
 
 // -- Face expressions (ported from DESKBUDDY-1.0, Edison Science Corner) --
 // 9 moods, cycled by single-tapping the face page. A fast spin of the board
@@ -608,8 +624,8 @@ bool settingsStored = false;   // booted from a readable /config.json; GET "stor
 static_assert(PAGE_FACE == 0 && PAGE_CLOCK == 1 && PAGE_DATE == 2 &&
               PAGE_WEATHER == 3 && PAGE_MOON == 4 && PAGE_STOCK == 5 &&
               PAGE_GITHUB == 6, "settings.pages[] is indexed by PAGE_* ids");
-static_assert(SETTINGS_PAGE_COUNT == APP_COUNT,
-              "settings.pages[] needs one entry per page");
+static_assert(SETTINGS_PAGE_COUNT + 3 == APP_COUNT,
+              "settings.pages[] needs one entry per page, except the usage and status pages");
 
 Arduino_DataBus *bus     = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI);
 Arduino_GFX    *display  = new Arduino_ST7789(bus, LCD_RST, 0, false, 172, 320, 34, 0, 34, 0);
@@ -682,7 +698,8 @@ float pressPulse   = 0.0f;
 struct WeatherData { bool valid; int temp, humidity, wind, code; bool isDay; uint32_t updatedAt; };
 struct StockData   { bool valid; float price, open, high, low;   uint32_t updatedAt; };
 struct GithubData  { bool valid; int followers, repos;            uint32_t updatedAt; };
-struct NetData     { WeatherData weather; StockData stock; GithubData github; };
+struct NetData     { WeatherData weather; StockData stock; GithubData github;
+                     UsageSlot claude, codex; };   // written by loop() only (POST /usage)
 
 NetData           netShared = {};
 NetData           netView   = {};
@@ -959,8 +976,21 @@ void buildPageList() {
     if (i == PAGE_STOCK && !stockConfigured()) continue;    // no key hides the page
     pageOrder[pageCount++] = i;
   }
+  if (netShared.claude.valid) pageOrder[pageCount++] = PAGE_CLAUDE;
+  if (netShared.codex.valid)  pageOrder[pageCount++] = PAGE_CODEX;
   if (pageCount == 0) pageOrder[pageCount++] = PAGE_FACE;  // never leave it empty
+  pageOrder[pageCount++] = PAGE_STATUS;
   if (currentPageIdx >= pageCount) currentPageIdx = 0;
+  currentApp = pageOrder[currentPageIdx];
+}
+
+// Rebuild the page list after a usage page appeared, staying on the page the
+// user is looking at.
+void rebuildPageListKeepPage() {
+  const uint8_t shown = currentApp;
+  buildPageList();
+  for (uint8_t i = 0; i < pageCount; i++)
+    if (pageOrder[i] == shown) { currentPageIdx = i; break; }
   currentApp = pageOrder[currentPageIdx];
 }
 
@@ -1804,6 +1834,222 @@ void drawGithub() {
   drawPageDots();
 }
 
+// ── Usage pages (Claude, Codex) ───────────────────────────
+// Numbers come from the PC (tools/usage_push.py), not from the internet, so
+// there is no Wi-Fi gate: a page shows what was pushed last, marked STALE once
+// the PC has been quiet for USAGE_STALE_MS.
+static constexpr uint32_t USAGE_STALE_MS = 30UL * 60UL * 1000UL;
+
+// Limit bar: blue under 70 %, yellow from 70 %, red from 90 % (CP AXTRA palette).
+static void drawUsageBar(int y, const char *label, int pct) {
+  const uint16_t col = pct >= 90 ? rgb(218,56,50) : pct >= 70 ? rgb(246,194,74) : rgb(48,111,199);
+  gfx->setTextSize(1); gfx->setTextColor(COL_LABEL);
+  gfx->setCursor(14, y + 2); gfx->print(label);
+  const int bx = 54, bw = 210, bh = 10;
+  gfx->fillRoundRect(bx, y, bw, bh, 3, rgb(40,40,40));
+  if (pct > 0) gfx->fillRoundRect(bx, y, max(6, bw * pct / 100), bh, 3, col);
+  char buf[8]; snprintf(buf, sizeof(buf), "%d%%", pct);
+  gfx->setTextColor(COL_VALUE);
+  gfx->setCursor(bx + bw + 8, y + 2); gfx->print(buf);
+}
+
+void drawUsagePage(const char *title, uint16_t accent, const UsageSlot &u) {
+  gfx->fillScreen(BG);
+  gfx->setTextSize(2); gfx->setTextColor(accent);
+  gfx->setCursor(14, 8); gfx->print(title);
+  if (millis() - u.updatedAt > USAGE_STALE_MS) {
+    gfx->setTextSize(1); gfx->setTextColor(rgb(246,194,74));
+    gfx->setCursor(SCREEN_W - 14 - 5 * 6, 12); gfx->print("STALE");
+  }
+  char buf[16];
+  formatTokens(u.today, buf, sizeof(buf));
+  gfx->setTextSize(6); gfx->setTextColor(COL_VALUE);
+  gfx->setCursor(14, 32); gfx->print(buf);
+  gfx->setTextSize(1); gfx->setTextColor(COL_LABEL);
+  gfx->setCursor(14, 82); gfx->print("TOKENS TODAY");
+  if (u.todayUsd >= 0) {          // estimated dollars, right of the label
+    formatUsd(u.todayUsd, buf, sizeof(buf));
+    gfx->setTextSize(2); gfx->setTextColor(accent);
+    gfx->setCursor(100, 82); gfx->print(buf);
+  }
+  formatTokens(u.week, buf, sizeof(buf));
+  gfx->setTextSize(3); gfx->setTextColor(accent);
+  gfx->setCursor(200, 36); gfx->print(buf);
+  gfx->setTextSize(1); gfx->setTextColor(COL_LABEL);
+  gfx->setCursor(200, 64); gfx->print("7 DAYS");
+  if (u.weekUsd >= 0) {
+    formatUsd(u.weekUsd, buf, sizeof(buf));
+    gfx->setTextSize(2); gfx->setTextColor(accent);
+    gfx->setCursor(200, 76); gfx->print(buf);
+  }
+
+  if (u.pct1 < 0 && u.pct2 < 0) {
+    gfx->setCursor(14, 112); gfx->print("NO LIMIT DATA");
+  } else {
+    int y = 104;
+    if (u.pct1 >= 0) { drawUsageBar(y, "LIMIT", u.pct1); y += 18; }
+    if (u.pct2 >= 0) { drawUsageBar(y, "WEEK", u.pct2); y += 18; }
+    if (u.reset1 >= 0) {
+      char r[20]; formatReset(u.reset1, r, sizeof(r));
+      gfx->setTextSize(1); gfx->setTextColor(COL_LABEL);
+      gfx->setCursor(14, y + 2); gfx->print("RESETS IN "); gfx->print(r);
+    }
+  }
+  drawPageDots();
+}
+
+void drawClaude() { drawUsagePage("CLAUDE", rgb(48,111,199), netView.claude); }
+void drawCodex()  { drawUsagePage("CODEX",  rgb(67,147,143), netView.codex); }
+
+// ── Status page ───────────────────────────────────────────
+uint8_t statusState = STATUS_FREE;
+
+// The word fills the screen on a colour per state (Lotus green, Makro red,
+// CP AXTRA yellow); black text on the yellow, white on the others.
+void drawStatus() {
+  const uint16_t bgs[STATUS_COUNT] = {rgb(67,147,143), rgb(218,56,50), rgb(246,194,74)};
+  const uint16_t bg = bgs[statusState % STATUS_COUNT];
+  const uint16_t fg = statusState == STATUS_MEETING ? rgb(0,0,0) : rgb(255,255,255);
+  gfx->fillScreen(bg);
+  gfx->setTextColor(fg);
+  if (statusState == STATUS_MEETING) {
+    const char *l1 = "IN A", *l2 = "MEETING";
+    gfx->setTextSize(6);
+    gfx->setCursor((SCREEN_W - (int)strlen(l1) * 36) / 2, 22); gfx->print(l1);
+    gfx->setCursor((SCREEN_W - (int)strlen(l2) * 36) / 2, 78); gfx->print(l2);
+  } else {
+    const char *w = statusLabel(statusState);
+    gfx->setTextSize(8);
+    gfx->setCursor((SCREEN_W - (int)strlen(w) * 48) / 2, 46); gfx->print(w);
+  }
+  drawPageDots();
+}
+
+// ── POST /usage ───────────────────────────────────────────
+// The PC pushes usage over the LAN to port USAGE_PORT. The first push pairs:
+// its X-Usage-Token is kept in NVS and every later push must carry the same
+// one. The check is only as strong as the Wi-Fi network: the body is plain
+// HTTP. To pair again, erase the NVS partition (README).
+static constexpr uint16_t USAGE_PORT = 8080;
+static constexpr size_t   USAGE_BODY_MAX = 512;
+WebServer   usageServer(USAGE_PORT);
+bool        usageServerUp = false;
+
+static bool tokenShapeOk(const String &t) {
+  if (t.length() < 16 || t.length() > 64) return false;
+  for (size_t i = 0; i < t.length(); i++) {
+    const char c = t[i];
+    if (!isalnum((unsigned char)c) && c != '-' && c != '_') return false;
+  }
+  return true;
+}
+
+static void usageReply(int code, const char *json) {
+  usageServer.send(code, "application/json", json);
+}
+
+// Shows a parsed push (from HTTP or from "@MB USAGE" over USB). A usage page
+// appears with its first push.
+static void storeUsage(UsageSlot &c, bool hasC, UsageSlot &x, bool hasX) {
+  const uint32_t now = millis();
+  bool layoutChanged = false;
+  if (hasC) { layoutChanged |= !netShared.claude.valid; c.updatedAt = now; publishNetData(netShared.claude, c); }
+  if (hasX) { layoutChanged |= !netShared.codex.valid;  x.updatedAt = now; publishNetData(netShared.codex, x); }
+  if (layoutChanged) rebuildPageListKeepPage();
+}
+
+// Checks X-Usage-Token and replies 401/403 itself on failure. `paired` is true
+// when no token was stored yet: the caller commits it with commitPairing() once
+// the request itself turned out valid.
+static bool authorizePush(String &token, bool &paired) {
+  token = usageServer.header("X-Usage-Token");
+  if (!tokenShapeOk(token)) { usageReply(401, "{\"error\":\"X-Usage-Token missing or malformed\"}"); return false; }
+  Preferences prefs;
+  prefs.begin("buddy", true);
+  const String stored = prefs.getString("usagetok", "");
+  prefs.end();
+  paired = stored.length() == 0;                 // first push: remember this token
+  if (paired) return true;
+  // Constant time, so response timing does not reveal how much matched.
+  uint8_t diff = stored.length() != token.length();
+  for (size_t i = 0; i < token.length() && i < stored.length(); i++) diff |= stored[i] ^ token[i];
+  if (diff) { usageReply(403, "{\"error\":\"wrong token; the Buddy is paired with another PC\"}"); return false; }
+  return true;
+}
+
+static void commitPairing(const String &token, bool paired) {
+  if (!paired) return;
+  Preferences prefs;
+  prefs.begin("buddy", false);
+  prefs.putString("usagetok", token);
+  prefs.end();
+  Serial.println("usage: paired with a PC");
+}
+
+// The body of a POST; replies 400 and returns false when it is missing or too long.
+static bool readBody(String &body) {
+  body = usageServer.arg("plain");
+  if (body.length() == 0 || body.length() > USAGE_BODY_MAX) {
+    usageReply(400, "{\"error\":\"body missing or over 512 bytes\"}");
+    return false;
+  }
+  return true;
+}
+
+static void replyBadRequest(const char *err) {
+  JsonDocument r; r["error"] = err;
+  String out; serializeJson(r, out);
+  usageReply(400, out.c_str());
+}
+
+static void handleUsagePost() {
+  String token, body;
+  bool paired;
+  if (!authorizePush(token, paired) || !readBody(body)) return;
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) { usageReply(400, "{\"error\":\"not JSON\"}"); return; }
+  UsageSlot c = {}, x = {};
+  bool hasC, hasX;
+  const char *err;
+  if (!usageParse(doc.as<JsonVariantConst>(), c, hasC, x, hasX, &err)) { replyBadRequest(err); return; }
+  commitPairing(token, paired);
+  storeUsage(c, hasC, x, hasX);
+  usageReply(200, paired ? "{\"ok\":true,\"paired\":true}" : "{\"ok\":true}");
+}
+
+static void handleStatusPost() {
+  String token, body;
+  bool paired;
+  if (!authorizePush(token, paired) || !readBody(body)) return;
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) { usageReply(400, "{\"error\":\"not JSON\"}"); return; }
+  uint8_t st;
+  const char *err;
+  if (!statusParse(doc.as<JsonVariantConst>(), st, &err)) { replyBadRequest(err); return; }
+  commitPairing(token, paired);
+  statusState = st;
+  usageReply(200, paired ? "{\"ok\":true,\"paired\":true}" : "{\"ok\":true}");
+}
+
+// Starts once Wi-Fi is up, then answers between frames.
+void serviceUsageServer() {
+  if (!usageServerUp) {
+    if (!wifiManager.isConnected()) return;
+    static const char *keys[] = {"X-Usage-Token"};
+    usageServer.collectHeaders(keys, 1);
+    usageServer.on("/usage", HTTP_POST, handleUsagePost);
+    usageServer.on("/status", HTTP_POST, handleStatusPost);
+    usageServer.on("/usage/ping", HTTP_GET, [] {
+      usageReply(200, "{\"buddy\":true,\"board\":\"" BOARD_NAME "\",\"fw\":\"" FW_VERSION "\"}");
+    });
+    usageServer.begin();
+    usageServerUp = true;
+    Serial.printf("usage: listening on http://%s:%u/usage\n",
+                  WiFi.localIP().toString().c_str(), (unsigned)USAGE_PORT);
+  }
+  usageServer.handleClient();
+}
+
 // ── Captive-portal screen ─────────────────────────────────
 // Shown full-screen while AWM's portal is running, so the user can read
 // the AP name/password off the device itself.
@@ -2116,6 +2362,28 @@ void mbDefaults() {
   scheduleRestart();
 }
 
+// USAGE {claude:{...}, codex:{...}}: the same body as POST /usage, over USB.
+// No token: whoever holds the cable already controls the board.
+void mbUsage(JsonDocument &body) {
+  UsageSlot c = {}, x = {};
+  bool hasC, hasX;
+  const char *err;
+  if (!usageParse(body.as<JsonVariantConst>(), c, hasC, x, hasX, &err)) { mbError(err); return; }
+  storeUsage(c, hasC, x, hasX);
+  mbOk();
+}
+
+// STATUS {"state": "free" | "busy" | "meeting"}: what the status page shows.
+void mbStatus(JsonDocument &body) {
+  uint8_t st;
+  const char *err;
+  if (!statusParse(body.as<JsonVariantConst>(), st, &err)) { mbError(err); return; }
+  statusState = st;
+  JsonDocument fields;
+  fields["state"] = statusLabel(st);
+  mbReply(true, fields);
+}
+
 void serviceProtocol() {
   while (Serial.available() > 0) {
     LineReader::Result r = mbReader.feed((char)Serial.read());
@@ -2147,6 +2415,8 @@ void serviceProtocol() {
       case MB_SET:      mbSet(body); break;
       case MB_REBOOT:   mbOk(); scheduleRestart(); break;
       case MB_DEFAULTS: mbDefaults(); break;
+      case MB_USAGE:    mbUsage(body); break;
+      case MB_STATUS:   mbStatus(body); break;
       default:          mbError("unknown command"); break;
     }
   }
@@ -2227,6 +2497,9 @@ void triggerFaceTap() {
   if (currentApp == 0) {
     faceMood = (faceMood+1) % FACE_MOOD_COUNT;
     pressPulse = 1.0f;
+  } else if (currentApp == PAGE_STATUS) {
+    statusState = (statusState + 1) % STATUS_COUNT;   // swipe still changes page
+    Serial.printf("Status: %s\n", statusLabel(statusState));
   } else {
     switchApp(1);
   }
@@ -2618,6 +2891,7 @@ void loop() {
   wifiManager.update();
   maintainWifi();
 
+  serviceUsageServer();
   readSensors();
   readTouch();
   flushBrightnessSave(false);
@@ -2651,7 +2925,10 @@ void loop() {
     case 3: drawWeather();    break;
     case 4: drawMoon();       break;
     case 5: drawStock();      break;
-    default: drawGithub();    break;
+    case 6: drawGithub();     break;
+    case 7: drawClaude();     break;
+    case 8: drawCodex();      break;
+    default: drawStatus();    break;
   }
   // Brightness or auto-advance feedback banner — shown briefly after a gesture.
   if (millis() < brightnessBannerUntil) {

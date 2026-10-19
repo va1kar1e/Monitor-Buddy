@@ -29,7 +29,7 @@ MbCommand mbParse(const char *line, const char **arg) {
   if (space) *arg = space + 1;
   static const struct { const char *name; MbCommand id; } COMMANDS[] = {
     {"INFO", MB_INFO}, {"GET", MB_GET}, {"SET", MB_SET}, {"REBOOT", MB_REBOOT},
-    {"DEFAULTS", MB_DEFAULTS}};
+    {"DEFAULTS", MB_DEFAULTS}, {"USAGE", MB_USAGE}, {"STATUS", MB_STATUS}};
   for (const auto &c : COMMANDS)
     if (strlen(c.name) == n && strncmp(cmd, c.name, n) == 0) return c.id;
   return MB_UNKNOWN;

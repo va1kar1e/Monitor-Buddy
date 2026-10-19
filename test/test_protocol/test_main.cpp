@@ -77,6 +77,15 @@ static void test_parse_defaults() {
   TEST_ASSERT_EQUAL(MB_UNKNOWN, mbParse("@MB defaults", &arg));
 }
 
+static void test_parse_usage() {
+  const char *arg = nullptr;
+  TEST_ASSERT_EQUAL(MB_USAGE, mbParse("@MB USAGE {\"codex\":{}}", &arg));
+  TEST_ASSERT_EQUAL_STRING("{\"codex\":{}}", arg);
+  TEST_ASSERT_EQUAL(MB_UNKNOWN, mbParse("@MB USAGES", &arg));
+  TEST_ASSERT_EQUAL(MB_STATUS, mbParse("@MB STATUS {\"state\":\"busy\"}", &arg));
+  TEST_ASSERT_EQUAL_STRING("{\"state\":\"busy\"}", arg);
+}
+
 static void test_command_word() {
   char w[17];
   mbCommandWord("@MB INFO", w, sizeof(w));
@@ -214,6 +223,7 @@ int main(int, char **) {
   RUN_TEST(test_parse_commands);
   RUN_TEST(test_parse_rejects_other_lines);
   RUN_TEST(test_parse_defaults);
+  RUN_TEST(test_parse_usage);
   RUN_TEST(test_command_word);
   RUN_TEST(test_command_word_truncates_at_16);
   RUN_TEST(test_command_word_edge_cases);
