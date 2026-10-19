@@ -18,3 +18,7 @@ config/config.h
 
 # Local working notes/scratch — never goes to GitHub
 .project/
+
+# Desktop app build output (tools/build_app.py)
+dist/
+build/

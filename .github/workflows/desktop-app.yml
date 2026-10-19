@@ -1,0 +1,46 @@
+name: Desktop app
+
+# Builds MonitorBuddy.exe (Windows) and MonitorBuddy.dmg (macOS) from
+# tools/buddy_app.py. Download them from the run's Artifacts. The builds are
+# not code-signed.
+on:
+  pull_request:
+    paths:
+      - "tools/**"
+      - ".github/workflows/desktop-app.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tools/**"
+      - ".github/workflows/desktop-app.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: monitor-buddy-app-windows
+            path: dist/MonitorBuddy.exe
+          - os: macos-latest
+            artifact: monitor-buddy-app-macos
+            path: dist/MonitorBuddy.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: pip install pyinstaller pyserial
+      - name: Tool tests
+        run: python -m unittest discover -s tools -v
+      - name: Build the app
+        run: python tools/build_app.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
