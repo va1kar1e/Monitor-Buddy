@@ -81,6 +81,15 @@ The last page is a status board: the word fills the screen on a colour, **FREE**
 - **On the Buddy:** tap the page to step Free → Busy → In a meeting. Swipe still changes page.
 - **From your computer:** `python tools/status_push.py --serial COM11 busy` (or `free`, `meeting`) over the USB cable, or `python tools/status_push.py <ip> busy` over Wi-Fi with the same pairing as the usage pages. This works from a hotkey, a Stream Deck button or a script.
 
+### Desktop app (optional)
+
+A small window for the two features above, so nothing has to be typed: pick the USB port (a Buddy is picked for you) or enter its Wi-Fi address, click **Free**, **Busy** or **In a meeting**, and tick **Send usage every 60 seconds** to keep the Claude and Codex pages current.
+
+- **Windows:** `MonitorBuddy.exe`. **macOS:** `MonitorBuddy.dmg`, drag the app to Applications. Both are built by the *Desktop app* workflow: open the run in the **Actions** tab and download them from **Artifacts**.
+- The apps are not code-signed, so the first start gets a warning. Windows: **More info → Run anyway**. macOS: right-click the app → **Open** → **Open** (or allow it under System Settings → Privacy & Security).
+- From source: `pip install pyserial` and `python tools/buddy_app.py`. To build the app yourself: `pip install pyinstaller pyserial` and `python tools/build_app.py` (it builds for the system it runs on).
+- Settings are kept in `~/.monitor-buddy-app.json`. Only one program can use the USB port at a time, so close the app before using the web flasher.
+
 ---
 
 ## 3. Assembly
