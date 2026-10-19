@@ -53,6 +53,16 @@ You also need a computer with **Chrome or Edge** to flash the board once. After 
 
 Nothing else. No resistors, no headers, no hot glue.
 
+### Using the ESP32-S3 board instead (experimental)
+
+The firmware also builds for the **Waveshare ESP32-S3-Touch-LCD-1.47**, which has the same 1.47" touchscreen as the C6 board. This is new and has not been tried on a real board yet, so treat it as a preview and please report what you find.
+
+- **Build it from source**, as in [4. Flashing the board](#4-flashing-the-board), but choose the `esp32-s3` environment: `pio run -e esp32-s3`, and `pio run -e esp32-s3 --target upload` to flash. In VS Code, pick `esp32-s3` in the PlatformIO environment switcher at the bottom of the window. The pin map for both boards is in [`lib/board/board_pins.h`](lib/board/board_pins.h).
+- **The web flasher does not support it yet.** It only recognises the ESP32-C6 board, and will say no compatible board was found.
+- **No motion sensor.** The S3 board has no QMI8658, so the eyes use the animated fallback motion instead of following the tilt. Everything else works the same.
+- **The BOOT button** is on a different pin but does the same job (see [4.10](#410-everyday-controls)).
+- **The printed holder** was designed for the C6 board. Check the S3 board's size against it before printing.
+
 ---
 
 ## 3. Assembly
@@ -271,7 +281,7 @@ The built-in values are the release defaults, or your `config/config.h` settings
 | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | The web flasher doesn't list the Buddy            | Use Chrome or Edge on a computer, and a USB-C cable that carries data (many are charge-only). Close any program that has the port open, such as a serial monitor in VS Code, then unplug the Buddy and plug it back in. On Windows, check Device Manager for an unknown device and install the driver linked in [4.6](#46-plug-in-the-board). |
 | The flasher says it's not a Buddy board           | It found an ESP32-C6 without the touchscreen and motion sensor, usually the Waveshare ESP32-C6-LCD-1.47 without touch. Monitor-Buddy needs the touchscreen version, the ESP32-C6-Touch-LCD-1.47 (see [2](#2-what-you-need)). Nothing was written to the board.                                                                                |
-| The flasher says no compatible board was found    | The board isn't an ESP32-C6 at all, for example an ESP32-S3 or ESP32-C3. Connect a Waveshare ESP32-C6-Touch-LCD-1.47 (see [2](#2-what-you-need)). Nothing was written to the board.                                                                                                                                                           |
+| The flasher says no compatible board was found    | The board isn't an ESP32-C6 at all, for example an ESP32-S3 or ESP32-C3. Connect a Waveshare ESP32-C6-Touch-LCD-1.47 (see [2](#2-what-you-need)). The ESP32-S3-Touch-LCD-1.47 works too, but only built from source (see [2](#using-the-esp32-s3-board-instead-experimental)). Nothing was written to the board.                                                                                                                                                           |
 | The Buddy stays dark after an interrupted install | Its firmware didn't finish installing. Connect it in the web flasher and choose **Install the firmware again**. The settings saved on the board stay.                                                                                                                                                                                         |
 | No port shown / Upload can't find the board       | Try a different USB-C cable. Many are charge-only. On Windows, check Device Manager for an unknown device and install the driver linked in [4.6](#46-plug-in-the-board).                                                                                                                                                                      |
 | Upload starts then fails                          | Close any serial monitor on the port, unplug the Buddy, plug it back in and click Upload again. If it no longer starts, reinstall it with the web flasher; your saved settings stay.                                                                                                                                                          |
