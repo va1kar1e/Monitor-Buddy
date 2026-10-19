@@ -2,14 +2,11 @@ name: Desktop app
 
 # Builds MonitorBuddy.exe (Windows) and MonitorBuddy.dmg (macOS) from
 # tools/buddy_app.py. Download them from the run's Artifacts. The builds are
-# not code-signed.
+# not code-signed. Runs on every push that touches tools/ (a pull request from
+# the same repository shows that run), or by hand from the Actions tab once
+# the workflow is on the default branch.
 on:
-  pull_request:
-    paths:
-      - "tools/**"
-      - ".github/workflows/desktop-app.yml"
   push:
-    branches: [main]
     paths:
       - "tools/**"
       - ".github/workflows/desktop-app.yml"
