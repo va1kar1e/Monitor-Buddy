@@ -12,7 +12,7 @@
 
 static const char MB_PREFIX[] = "@MB ";
 
-enum MbCommand { MB_NONE, MB_INFO, MB_GET, MB_SET, MB_REBOOT, MB_DEFAULTS, MB_UNKNOWN };
+enum MbCommand { MB_NONE, MB_INFO, MB_GET, MB_SET, MB_REBOOT, MB_DEFAULTS, MB_USAGE, MB_STATUS, MB_UNKNOWN };
 
 // Collects serial bytes into lines; '\r' is ignored. A line longer than
 // CAPACITY is dropped whole: TOO_LONG if it started with the prefix (so the
