@@ -49,6 +49,65 @@ class Month(unittest.TestCase):
         self.assertIsNone(b.call_args[1]["month_limit"])
 
 
+class Pages(unittest.TestCase):
+    def test_fetch_page_uses_the_saved_settings(self):
+        c = controller(lat="1.5", lon="2.5", fahrenheit=True, mph=True, github_user="octo", ticker="msft",
+                       finnhub_key="K")
+        with mock.patch.object(ba.bp, "weather_page", return_value={}) as w, \
+             mock.patch.object(ba.bp, "github_page", return_value={}) as g, \
+             mock.patch.object(ba.bp, "stock_page", return_value={}) as s:
+            c.fetch_page("weather")
+            c.fetch_page("github")
+            c.fetch_page("stock")
+        w.assert_called_once_with("1.5", "2.5", True, True)
+        g.assert_called_once_with("octo")
+        s.assert_called_once_with("msft", "K")
+        with self.assertRaises(ValueError):
+            c.fetch_page("moon")
+
+    def test_wifi_page_over_wifi_knows_only_the_address(self):
+        c = controller(mode="wifi", host="10.0.0.5:8080")
+        self.assertEqual(c.wifi_page(), {"ssid": None, "ip": "10.0.0.5", "rssi": None, "connected": True})
+        with self.assertRaises(ba.bp.FetchError):
+            controller(mode="wifi", host="").wifi_page()
+
+    def test_wifi_page_over_usb_reads_info(self):
+        c = controller(mode="usb", port="COM11")
+        reply = {"ok": True, "cmd": "INFO",
+                 "wifi": {"ssid": "Home", "ip": "192.168.1.186", "rssi": -52, "connected": True}}
+        with mock.patch.object(up, "serial_command", return_value=(reply, "")) as sc:
+            page = c.wifi_page()
+        sc.assert_called_once_with("COM11", "INFO")
+        self.assertEqual(page, {"ssid": "Home", "ip": "192.168.1.186", "rssi": -52, "connected": True})
+
+    def test_wifi_page_old_firmware_has_no_ip(self):
+        c = controller(mode="usb", port="COM11")
+        reply = {"ok": True, "cmd": "INFO", "wifi": {"ssid": "Home", "connected": True, "rssi": -50}}
+        with mock.patch.object(up, "serial_command", return_value=(reply, "")):
+            self.assertIsNone(c.wifi_page()["ip"])
+
+    def test_wifi_page_no_answer_is_a_readable_error(self):
+        c = controller(mode="usb", port="COM11")
+        with mock.patch.object(up, "serial_command", return_value=(None, "no reply")):
+            with self.assertRaises(ba.bp.FetchError) as cm:
+                c.wifi_page()
+        self.assertIn("no reply", str(cm.exception))
+
+    def test_load_from_buddy_copies_settings_and_saves(self):
+        c = controller(mode="usb", port="COM11")
+        reply = {"ok": True, "cmd": "GET",
+                 "config": {"lat": "1.3", "lon": "103.8", "github_user": "octo", "ticker": "AVGO",
+                            "temp_unit": "fahrenheit", "wind_unit": "mph"}}
+        with mock.patch.object(up, "serial_command", return_value=(reply, "")):
+            c.load_from_buddy()
+        self.assertEqual((c.settings["lat"], c.settings["github_user"], c.settings["ticker"]),
+                         ("1.3", "octo", "AVGO"))
+        self.assertTrue(c.settings["fahrenheit"] and c.settings["mph"])
+        self.assertEqual(ba.Controller(c.path).settings["ticker"], "AVGO")   # saved
+        with self.assertRaises(ba.bp.FetchError):
+            controller(mode="wifi", host="1.2.3.4").load_from_buddy()
+
+
 class Colors(unittest.TestCase):
     def test_bar_color_thresholds(self):
         self.assertEqual(ba.bar_color(0.0), ba.BLUE)
@@ -147,8 +206,18 @@ class Window(unittest.TestCase):
             self.skipTest("no display")
         try:
             root.withdraw()
-            app = ba.App(root, controller())
+            app = ba.App(root, controller(), autostart=False)
             self.assertEqual(set(app.buttons), {"free", "busy", "meeting"})
+            self.assertEqual(app.listbox.size(), len(ba.bp.PAGES))
+            app.show_page("weather", {"temp": 31, "humidity": 70, "wind": 9, "text": "CLEAR", "is_day": True,
+                                      "unit": "C", "wind_unit": "KMH"}, None)
+            self.assertEqual(app.page_labels[("weather", "temp")].cget("text"), "31\u00b0C")
+            app.show_page("stock", None, "set a Finnhub key")
+            self.assertEqual(app.page_labels[("stock", "error")].cget("text"), "set a Finnhub key")
+            app.show_page("wifi", {"ssid": "Home", "ip": "192.168.1.186", "rssi": -52, "connected": True}, None)
+            self.assertEqual(app.page_labels[("wifi", "ip")].cget("text"), "192.168.1.186")
+            app.show_page("github", {"followers": 1234, "repos": 5}, None)
+            self.assertEqual(app.page_labels[("github", "followers")].cget("text"), "1,234 followers")
             app.show_usage({"claude": {"today": 76217, "week": 123158, "today_usd": 3.88, "week_usd": 6.24},
                             "codex": {"today": 0, "week": 11094439, "today_usd": 0.0, "week_usd": 203.23,
                                       "month": 15611974, "month_usd": 348.95, "month_limit_usd": 400,
