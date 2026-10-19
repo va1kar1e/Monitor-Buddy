@@ -5,7 +5,7 @@
 [![Arduino](https://img.shields.io/badge/framework-Arduino-00979d?logo=arduino)](https://www.arduino.cc/)
 [![License](https://img.shields.io/badge/license-MIT-6c757d)](LICENSE)
 
-**A tiny friend for the side of your monitor.** It pulls faces at you, follows your movements with its eyes, and in its spare time tells you the weather, the date, the moon phase, your stock ticker, and your GitHub stats.
+**A tiny friend for the side of your monitor.** It pulls faces at you, follows your movements with its eyes, and in its spare time tells you the weather, the date, your stock ticker, and your GitHub stats.
 
 <!-- SHOT: hero.jpg - Monitor-Buddy clipped to the right edge of a monitor, screen showing the animated face, taken slightly from the side so you can see the printed holder -->
 
@@ -24,9 +24,9 @@ It is also genuinely useful when you swipe past the face:
 - **Animated face** with several expressions, driven by the on-board QMI8658 motion sensor
 - **Clock** and **weekday / date**, kept accurate over NTP
 - **Weather** for your location (temperature, conditions, humidity, wind)
-- **Moon phase** with illumination percentage
 - **Stock ticker** for any US symbol, via a free Finnhub account
 - **GitHub stats** for your username
+- **Wi-Fi network and IP address**: the last page shows the network the Buddy joined and its IP address (the one the desktop app and `tools/usage_push.py` need)
 - **5 colour themes**, from plain white-on-black to a green-up / red-down semantic theme
 - **Toggle any page on or off** so your Buddy only shows what you care about
 - **Left or right side** of your monitor: one setting turns the screen, touch and eye movement around for a right-side mount
