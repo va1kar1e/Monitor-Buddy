@@ -296,8 +296,9 @@ def push(base, token, body, timeout=8, path="/usage"):
             return e.code, None
 
 
-def push_serial(port, body, timeout=3.0, command="USAGE"):
-    """Send "@MB <command> <body>" and wait for the reply. Returns (ok, error text)."""
+def serial_command(port, command, body=None, timeout=3.0):
+    """Send "@MB <command> [<body>]" and wait for the reply. Returns (reply, "") with
+    the reply as a dict, or (None, why)."""
     try:
         import serial
     except ImportError:
@@ -307,23 +308,39 @@ def push_serial(port, body, timeout=3.0, command="USAGE"):
     ser.port, ser.baudrate, ser.timeout = port, 115200, 0.2
     ser.dtr = False
     ser.rts = False
+    line_out = b"@MB " + command.encode()
+    if body is not None:
+        line_out += b" " + json.dumps(body, separators=(",", ":")).encode()
     try:
         ser.open()
-        ser.write(b"@MB " + command.encode() + b" " + json.dumps(body, separators=(",", ":")).encode() + b"\n")
+        ser.write(line_out + b"\n")
         deadline = time.time() + timeout
         buf = b""
         while time.time() < deadline:
             buf += ser.read(256)
             for line in buf.split(b"\n"):
                 line = line.strip()
-                if line.startswith(b"@MB ") and b'"cmd":"' + command.encode() + b'"' in line:
+                if not line.startswith(b"@MB "):
+                    continue
+                try:
                     reply = json.loads(line[4:])
-                    return bool(reply.get("ok")), reply.get("error", "")
-        return False, "no reply (is this firmware new enough to have " + command + "?)"
+                except ValueError:
+                    continue   # a line still arriving
+                if isinstance(reply, dict) and reply.get("cmd") == command:
+                    return reply, ""
+        return None, "no reply (is this firmware new enough to have " + command + "?)"
     except (serial.SerialException, OSError) as e:
-        return False, str(e)
+        return None, str(e)
     finally:
         ser.close()
+
+
+def push_serial(port, body, timeout=3.0, command="USAGE"):
+    """Send "@MB <command> <body>" and wait for the reply. Returns (ok, error text)."""
+    reply, why = serial_command(port, command, body, timeout)
+    if reply is None:
+        return False, why
+    return bool(reply.get("ok")), reply.get("error", "")
 
 
 def main(argv=None):

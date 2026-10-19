@@ -2292,7 +2292,10 @@ void mbInfo() {
   w["ssid"]  = (const char *)ssid;
   bool up = !wifiManager.isPortalActive() && wifiManager.isConnected();
   w["connected"] = up;
-  if (up) w["rssi"] = wifiManager.getSignalStrength();
+  if (up) {
+    w["rssi"] = wifiManager.getSignalStrength();
+    w["ip"]   = WiFi.localIP().toString();
+  }
   mbReply(true, doc);
 }
 

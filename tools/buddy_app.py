@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Monitor Buddy desktop app: set the status page and push Claude / Codex usage.
+"""Monitor Buddy desktop app: every page of the Buddy, its status, and usage push.
 
     python tools/buddy_app.py
 
-A small window for what tools/status_push.py and tools/usage_push.py do on the
-command line: pick the USB port (or enter the Buddy's Wi-Fi address), click Free
-/ Busy / In a meeting, and optionally let the app push your Claude Code and Codex
-token usage every minute. Built into MonitorBuddy.exe (Windows) and a .dmg
-(macOS) by tools/build_app.py and the "Desktop app" workflow.
+The list on the left has one entry per page the Buddy shows (Face, Clock, Date,
+Weather, Stock, GitHub, Claude, Codex, Status, Wi-Fi); click one to see its
+numbers. Pick the USB port (or enter the Buddy's Wi-Fi address), click Free /
+Busy / In a meeting on the Status page, and optionally let the app push your
+Claude Code and Codex token usage every minute. Built into MonitorBuddy.exe
+(Windows) and a .dmg (macOS) by tools/build_app.py and the "Desktop app"
+workflow.
+
+The Buddy fetches its own weather, GitHub and stock numbers, so this app asks the
+same public services with the same settings; "Load from Buddy" (USB) copies the
+location, GitHub user and ticker from the Buddy. The Finnhub key is typed in
+here and kept in ~/.monitor-buddy-app.json (plain text, like config.h).
 
 Needs pyserial for USB:  pip install pyserial
-Settings are kept in ~/.monitor-buddy-app.json.
 """
 import datetime as dt
 import json
@@ -21,17 +27,22 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
+import buddy_pages as bp
 import usage_push as up
 
 SETTINGS_PATH = Path("~/.monitor-buddy-app.json").expanduser()
 DEFAULTS = {"mode": "usb", "port": "", "host": "", "interval": 60, "auto_usage": False,
-            "month_limit": 400}
+            "month_limit": 400,
+            "lat": "13.7563", "lon": "100.5018", "fahrenheit": False, "mph": False,
+            "github_user": "", "ticker": "AAPL", "finnhub_key": ""}
 
 # CP AXTRA palette.
 BLUE, YELLOW, GREEN, RED = "#306FC7", "#F6C24A", "#43938F", "#DA3832"
+GRAY = "#666666"
 STATES = [("free", "Free", GREEN, "white"), ("busy", "Busy", RED, "white"),
           ("meeting", "In a meeting", YELLOW, "black")]
 ESPRESSIF_VID = 0x303A   # the S3's native USB port
+REFRESH_SECONDS = 600    # weather, stock and GitHub
 
 
 def short_tokens(n):
@@ -46,7 +57,7 @@ def short_tokens(n):
 
 
 def summary(body):
-    """One line for the window: 'Claude 76k / $3.88   Codex 0 / $0.00'."""
+    """One line for the log: 'Claude 76k / $3.88   Codex 0 / $0.00'."""
     parts = []
     for name in ("claude", "codex"):
         t = body.get(name)
@@ -123,9 +134,9 @@ def list_ports():
 
 
 class Controller:
-    """Everything the window does that is not drawing. One send at a time: a
-    serial port cannot be shared, and two pushes at once would only confuse
-    the Buddy."""
+    """Everything the window does that is not drawing. One serial or Wi-Fi
+    exchange at a time: a serial port cannot be shared, and two pushes at once
+    would only confuse the Buddy."""
 
     def __init__(self, settings_path=SETTINGS_PATH):
         self.path = Path(settings_path)
@@ -190,37 +201,124 @@ class Controller:
             ok, msg = self._send(body, "USAGE", "/usage")
         return ok, msg, body
 
+    # ── the Buddy's own pages ─────────────────────────────
+    def wifi_page(self):
+        """{'ssid', 'ip', 'rssi', 'connected'} of the Buddy: over USB from its INFO
+        reply; over Wi-Fi only the address we were given is known."""
+        s = self.settings
+        if s["mode"] == "wifi":
+            host = s["host"].strip().split(":")[0]
+            if not host:
+                raise bp.FetchError("Enter the Buddy's Wi-Fi address first.")
+            return {"ssid": None, "ip": host, "rssi": None, "connected": True}
+        if not s["port"]:
+            raise bp.FetchError("Pick the Buddy's USB port first.")
+        with self.lock:
+            reply, why = up.serial_command(s["port"], "INFO")
+        if reply is None or not reply.get("ok"):
+            raise bp.FetchError(why or (reply or {}).get("error", "the Buddy did not answer"))
+        w = reply.get("wifi") or {}
+        return {"ssid": w.get("ssid") or None, "ip": w.get("ip"), "rssi": w.get("rssi"),
+                "connected": bool(w.get("connected"))}
+
+    def load_from_buddy(self):
+        """Copies location, GitHub user, ticker and units from the Buddy (USB)."""
+        s = self.settings
+        if s["mode"] != "usb" or not s["port"]:
+            raise bp.FetchError("Reading the Buddy's settings needs the USB cable.")
+        with self.lock:
+            reply, why = up.serial_command(s["port"], "GET")
+        if reply is None or not reply.get("ok"):
+            raise bp.FetchError(why or (reply or {}).get("error", "the Buddy did not answer"))
+        c = reply.get("config") or {}
+        for key in ("lat", "lon", "github_user", "ticker"):
+            if c.get(key) is not None:
+                s[key] = c[key]
+        s["fahrenheit"] = c.get("temp_unit") == "fahrenheit"
+        s["mph"] = c.get("wind_unit") == "mph"
+        self.save()
+
+    def fetch_page(self, key):
+        """The data for one network page; raises buddy_pages.FetchError."""
+        s = self.settings
+        if key == "weather":
+            return bp.weather_page(s["lat"], s["lon"], s["fahrenheit"], s["mph"])
+        if key == "github":
+            return bp.github_page(s["github_user"])
+        if key == "stock":
+            return bp.stock_page(s["ticker"], s["finnhub_key"])
+        if key == "wifi":
+            return self.wifi_page()
+        raise ValueError(key)
+
 
 class App:
-    def __init__(self, root, controller):
+    def __init__(self, root, controller, autostart=True):
+        """autostart=False builds the window without reading logs or the internet (tests)."""
         self.root, self.ctl = root, controller
         self.events = queue.Queue()
         self.current = None          # the status last sent successfully
         self.tick_id = None          # the pending usage_tick, so there is only ever one
         self.buttons = {}
+        self.cells = {}
+        self.vars = {}               # setting name -> tk variable of its entry
+        self.page_frames = {}
+        self.page_labels = {}        # (page, field) -> label
         self.port_map = {}           # combobox label -> device
         root.title("Monitor Buddy")
-        root.minsize(560, 700)
+        root.minsize(760, 660)
         self.build()
         self.refresh_ports()
         self.root.after(150, self.drain)
-        self.refresh_usage()
-        if self.ctl.settings["auto_usage"]:
-            self.root.after(500, self.usage_tick)
+        self.tick_clock()
+        if autostart:
+            self.refresh_usage()
+            self.refresh_network_pages()
+            if self.ctl.settings["auto_usage"]:
+                self.root.after(500, self.usage_tick)
 
     # ── layout ────────────────────────────────────────────
     def build(self):
-        s = self.ctl.settings
         head = tk.Frame(self.root, bg=BLUE)
         head.pack(fill="x")
         tk.Label(head, text="Monitor Buddy", bg=BLUE, fg="white",
-                 font=("Helvetica", 18, "bold")).pack(anchor="w", padx=16, pady=12)
+                 font=("Helvetica", 18, "bold")).pack(anchor="w", padx=16, pady=10)
 
-        body = ttk.Frame(self.root, padding=16)
-        body.pack(fill="both", expand=True)
+        top = ttk.Frame(self.root, padding=(16, 12, 16, 0))
+        top.pack(fill="x")
+        self.build_connection(top)
 
-        # Connection
-        conn = ttk.LabelFrame(body, text="Connection", padding=10)
+        mid = ttk.Frame(self.root, padding=(16, 12, 16, 0))
+        mid.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(mid, width=14, exportselection=False, activestyle="none",
+                                  font=("Helvetica", 12), height=10)
+        for _, label in bp.PAGES:
+            self.listbox.insert("end", label)
+        self.listbox.pack(side="left", fill="y")
+        self.listbox.bind("<<ListboxSelect>>", lambda e: self.on_page())
+        self.stage = ttk.Frame(mid, padding=(16, 0, 0, 0))
+        self.stage.pack(side="left", fill="both", expand=True)
+        for key, _ in bp.PAGES:
+            f = ttk.Frame(self.stage)
+            f.grid(row=0, column=0, sticky="nsew")
+            self.page_frames[key] = f
+            getattr(self, f"page_{key}")(f)
+        self.stage.rowconfigure(0, weight=1)
+        self.stage.columnconfigure(0, weight=1)
+
+        self.build_usage_sending(ttk.Frame(self.root, padding=(16, 10, 16, 0)))
+        lf = ttk.LabelFrame(self.root, text="Log", padding=6)
+        lf.pack(fill="x", padx=16, pady=(10, 14))
+        self.log = tk.Text(lf, height=4, state="disabled", wrap="word", font=("Courier", 10))
+        self.log.pack(fill="x")
+
+        self.on_mode()
+        self.listbox.selection_set(1)   # open on the Clock, the first page with numbers
+        self.on_page()
+
+    def build_connection(self, parent):
+        s = self.ctl.settings
+        conn = ttk.LabelFrame(parent, text="Connection", padding=8)
         conn.pack(fill="x")
         self.mode = tk.StringVar(value=s["mode"])
         ttk.Radiobutton(conn, text="USB cable", variable=self.mode, value="usb",
@@ -230,87 +328,175 @@ class App:
         self.port_box.grid(row=0, column=1, padx=8, sticky="we")
         self.port_box.bind("<<ComboboxSelected>>", lambda e: self.on_port())
         ttk.Button(conn, text="Refresh", command=self.refresh_ports).grid(row=0, column=2)
+        ttk.Button(conn, text="Load from Buddy", command=self.load_from_buddy).grid(row=0, column=3, padx=(8, 0))
         ttk.Radiobutton(conn, text="Wi-Fi", variable=self.mode, value="wifi",
-                        command=self.on_mode).grid(row=1, column=0, sticky="w", pady=(8, 0))
+                        command=self.on_mode).grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.host = tk.StringVar(value=s["host"])
         self.host_entry = ttk.Entry(conn, textvariable=self.host, width=36)
-        self.host_entry.grid(row=1, column=1, padx=8, pady=(8, 0), sticky="we")
+        self.host_entry.grid(row=1, column=1, padx=8, pady=(6, 0), sticky="we")
         self.host.trace_add("write", lambda *a: self.on_host())
-        ttk.Label(conn, text="IP address, e.g. 192.168.1.50").grid(row=1, column=2, pady=(8, 0))
+        ttk.Label(conn, text="IP address, e.g. 192.168.1.50").grid(row=1, column=2, columnspan=2, pady=(6, 0))
         conn.columnconfigure(1, weight=1)
 
-        # Status
-        st = ttk.LabelFrame(body, text="Status", padding=10)
-        st.pack(fill="x", pady=(14, 0))
-        row = tk.Frame(st)
-        row.pack(fill="x")
+    def build_usage_sending(self, frame):
+        s = self.ctl.settings
+        frame.pack(fill="x")
+        self.auto = tk.BooleanVar(value=s["auto_usage"])
+        ttk.Checkbutton(frame, text="Send Claude / Codex usage every", variable=self.auto,
+                        command=self.on_auto).pack(side="left")
+        self.interval = tk.IntVar(value=int(s["interval"]))
+        spin = ttk.Spinbox(frame, from_=10, to=3600, increment=10, width=6, textvariable=self.interval,
+                           command=self.on_interval)
+        spin.pack(side="left", padx=6)
+        spin.bind("<FocusOut>", lambda e: self.on_interval())
+        ttk.Label(frame, text="seconds").pack(side="left")
+        ttk.Button(frame, text="Send now", command=self.send_usage_now).pack(side="left", padx=(12, 0))
+        ttk.Label(frame, text="Monthly limit $").pack(side="left", padx=(16, 4))
+        self.month_limit = tk.IntVar(value=int(s["month_limit"]))
+        lim = ttk.Spinbox(frame, from_=0, to=100000, increment=50, width=6, textvariable=self.month_limit,
+                          command=self.on_month_limit)
+        lim.pack(side="left")
+        lim.bind("<FocusOut>", lambda e: self.on_month_limit())
+
+    # ── pages ─────────────────────────────────────────────
+    def title(self, frame, text, color=BLUE):
+        tk.Label(frame, text=text, fg="white", bg=color, font=("Helvetica", 12, "bold"),
+                 padx=10, pady=3).pack(anchor="w")
+
+    def big(self, frame, page, field, size=34, text="-"):
+        lab = tk.Label(frame, text=text, font=("Helvetica", size, "bold"), anchor="w")
+        lab.pack(anchor="w", pady=(10, 0))
+        self.page_labels[(page, field)] = lab
+        return lab
+
+    def small(self, frame, page, field, text="", color=GRAY, wrap=460):
+        lab = tk.Label(frame, text=text, fg=color, font=("Helvetica", 11), anchor="w", justify="left", wraplength=wrap)
+        lab.pack(anchor="w", pady=(4, 0))
+        self.page_labels[(page, field)] = lab
+        return lab
+
+    def entry(self, parent, setting, width=14, show=None):
+        var = tk.StringVar(value=str(self.ctl.settings[setting]))
+        self.vars[setting] = var
+        ttk.Entry(parent, textvariable=var, width=width, show=show or "").pack(side="left", padx=6)
+        var.trace_add("write", lambda *a: self.on_setting(setting, var.get()))
+
+    def entry_row(self, frame, setting, label, width=14, show=None):
+        row = ttk.Frame(frame)
+        row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(row, text=label).pack(side="left")
+        self.entry(row, setting, width, show)
+        return row
+
+    def refresh_button(self, frame, keys):
+        ttk.Button(frame, text="Refresh", command=lambda: self.refresh_network_pages(keys)).pack(anchor="w", pady=8)
+
+    def page_face(self, f):
+        self.title(f, "Face")
+        self.big(f, "face", "text", 22, "The animated face")
+        self.small(f, "face", "note", "It blinks, glances around and follows the Buddy's tilt. There are no numbers "
+                                      "to show: tap it on the Buddy to change its expression.")
+
+    def page_clock(self, f):
+        self.title(f, "Clock")
+        self.big(f, "clock", "time", 54, "--:--:--")
+        self.small(f, "clock", "note", "This computer's time. The Buddy keeps its own clock over NTP, in the time zone "
+                                       "saved on it.")
+
+    def page_date(self, f):
+        self.title(f, "Date")
+        self.big(f, "date", "weekday", 40, "-")
+        self.big(f, "date", "day", 26, "-")
+
+    def page_weather(self, f):
+        self.title(f, "Weather")
+        self.big(f, "weather", "temp", 54, "-")
+        self.big(f, "weather", "text", 20, "")
+        self.small(f, "weather", "more", "")
+        row = self.entry_row(f, "lat", "Latitude", 10)
+        ttk.Label(row, text="Longitude").pack(side="left", padx=(12, 0))
+        self.entry(row, "lon", 10)
+        self.small(f, "weather", "error", "", RED)
+        self.refresh_button(f, ["weather"])
+
+    def page_stock(self, f):
+        self.title(f, "Stock")
+        self.big(f, "stock", "price", 44, "-")
+        self.small(f, "stock", "more", "")
+        self.entry_row(f, "ticker", "Ticker", 10)
+        self.entry_row(f, "finnhub_key", "Finnhub key", 30, show="*")
+        self.small(f, "stock", "error", "", RED)
+        self.refresh_button(f, ["stock"])
+
+    def page_github(self, f):
+        self.title(f, "GitHub")
+        self.big(f, "github", "followers", 44, "-")
+        self.small(f, "github", "repos", "")
+        self.entry_row(f, "github_user", "GitHub user", 24)
+        self.small(f, "github", "error", "", RED)
+        self.refresh_button(f, ["github"])
+
+    def page_usage(self, f, name, title, color):
+        self.title(f, title, color)
+        table = tk.Frame(f)
+        table.pack(fill="x", pady=(10, 0))
+        for c, head in enumerate(("Today", "7 days", "This month")):
+            tk.Label(table, text=head, fg=GRAY, font=("Helvetica", 10)).grid(row=0, column=c, sticky="w", padx=4)
+        for c, key in enumerate(("today", "week", "month")):
+            lab = tk.Label(table, text="-", font=("Helvetica", 14, "bold"), anchor="w")
+            lab.grid(row=1, column=c, sticky="we", padx=4, pady=(4, 0))
+            self.cells[(name, key)] = lab
+            table.columnconfigure(c, weight=1)
+        bar = Bar(table)
+        bar.grid(row=2, column=0, columnspan=3, sticky="we", padx=4, pady=(6, 0))
+        self.cells[(name, "bar")] = bar
+        lim = tk.Label(table, text="", fg=GRAY, font=("Helvetica", 10), anchor="w")
+        lim.grid(row=3, column=0, columnspan=3, sticky="we", padx=4)
+        self.cells[(name, "limit")] = lim
+        self.small(f, name, "read", "Reading your logs...")
+        self.small(f, name, "note", "Tokens are input + output; $ is an estimate at API list prices.")
+        ttk.Button(f, text="Refresh", command=self.refresh_usage).pack(anchor="w", pady=8)
+
+    def page_claude(self, f):
+        self.page_usage(f, "claude", "Claude", BLUE)
+
+    def page_codex(self, f):
+        self.page_usage(f, "codex", "Codex", GREEN)
+
+    def page_status(self, f):
+        self.title(f, "Status")
+        row = tk.Frame(f)
+        row.pack(fill="x", pady=(14, 0))
         for i, (key, label, bg, fg) in enumerate(STATES):
             b = tk.Label(row, text=label, bg=bg, fg=fg, font=("Helvetica", 14, "bold"),
-                         padx=6, pady=16, cursor="hand2", bd=3, relief="flat")
+                         padx=6, pady=22, cursor="hand2", bd=3, relief="flat")
             b.grid(row=0, column=i, sticky="we", padx=4)
             b.bind("<Button-1>", lambda e, k=key: self.set_status(k))
             row.columnconfigure(i, weight=1, uniform="st")
             self.buttons[key] = b
-        self.status_note = ttk.Label(st, text="Tap a button, or tap the Buddy's screen.")
-        self.status_note.pack(anchor="w", pady=(8, 0))
+        self.small(f, "status", "note", "Click a button, or tap the Buddy's screen.")
 
-        # Usage
-        us = ttk.LabelFrame(body, text="Claude and Codex usage", padding=10)
-        us.pack(fill="x", pady=(14, 0))
-        self.auto = tk.BooleanVar(value=s["auto_usage"])
-        ttk.Checkbutton(us, text="Send usage every", variable=self.auto,
-                        command=self.on_auto).grid(row=0, column=0, sticky="w")
-        self.interval = tk.IntVar(value=int(s["interval"]))
-        spin = ttk.Spinbox(us, from_=10, to=3600, increment=10, width=6, textvariable=self.interval,
-                           command=self.on_interval)
-        spin.grid(row=0, column=1, padx=6)
-        spin.bind("<FocusOut>", lambda e: self.on_interval())
-        ttk.Label(us, text="seconds").grid(row=0, column=2, sticky="w")
-        ttk.Button(us, text="Send now", command=self.send_usage_now).grid(row=0, column=3, padx=(16, 0))
-        ttk.Label(us, text="Monthly limit $").grid(row=0, column=4, padx=(16, 4))
-        self.month_limit = tk.IntVar(value=int(s["month_limit"]))
-        lim_spin = ttk.Spinbox(us, from_=0, to=100000, increment=50, width=6, textvariable=self.month_limit,
-                               command=self.on_month_limit)
-        lim_spin.grid(row=0, column=5)
-        lim_spin.bind("<FocusOut>", lambda e: self.on_month_limit())
-
-        table = tk.Frame(us)
-        table.grid(row=1, column=0, columnspan=6, sticky="we", pady=(10, 0))
-        for c, head in enumerate(("", "Today", "7 days", "This month")):
-            tk.Label(table, text=head, fg="#666666", font=("Helvetica", 10)).grid(row=0, column=c, sticky="w", padx=4)
-        self.cells = {}
-        for r, (name, color) in enumerate((("claude", BLUE), ("codex", GREEN)), start=1):
-            tk.Label(table, text=name.title(), fg="white", bg=color, width=8,
-                     font=("Helvetica", 11, "bold")).grid(row=r * 2 - 1, column=0, sticky="we", padx=4, pady=(4, 0))
-            for c, key in ((1, "today"), (2, "week"), (3, "month")):
-                lab = tk.Label(table, text="-", font=("Helvetica", 12, "bold"), anchor="w")
-                lab.grid(row=r * 3 - 2, column=c, sticky="we", padx=4, pady=(6, 0))
-                self.cells[(name, key)] = lab
-            mbar = Bar(table)
-            mbar.grid(row=r * 3 - 1, column=1, columnspan=3, sticky="we", padx=4, pady=(2, 0))
-            self.cells[(name, "bar")] = mbar
-            lim = tk.Label(table, text="", fg="#666666", font=("Helvetica", 10), anchor="w")
-            lim.grid(row=r * 3, column=1, columnspan=3, sticky="we", padx=4)
-            self.cells[(name, "limit")] = lim
-        for c in (1, 2, 3):
-            table.columnconfigure(c, weight=1)
-        bar = tk.Frame(us)
-        bar.grid(row=2, column=0, columnspan=6, sticky="we", pady=(8, 0))
-        self.usage_line = ttk.Label(bar, text="Reading your logs...")
-        self.usage_line.pack(side="left")
-        ttk.Button(bar, text="Refresh", command=self.refresh_usage).pack(side="right")
-        ttk.Label(us, text="Tokens are input + output; $ is an estimate at API list prices.",
-                  foreground="#666666").grid(row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
-
-        # Log
-        lf = ttk.LabelFrame(body, text="Log", padding=6)
-        lf.pack(fill="both", expand=True, pady=(14, 0))
-        self.log = tk.Text(lf, height=6, state="disabled", wrap="word", font=("Courier", 10))
-        self.log.pack(fill="both", expand=True)
-
-        self.on_mode()
+    def page_wifi(self, f):
+        self.title(f, "Wi-Fi")
+        self.big(f, "wifi", "ssid", 26, "-")
+        self.big(f, "wifi", "ip", 34, "-")
+        self.small(f, "wifi", "more", "")
+        self.small(f, "wifi", "error", "", RED)
+        self.refresh_button(f, ["wifi"])
 
     # ── settings ──────────────────────────────────────────
+    def on_page(self):
+        sel = self.listbox.curselection()
+        if sel:
+            key = bp.PAGES[sel[0]][0]
+            self.page_frames[key].tkraise()
+            if key == "wifi":
+                self.refresh_network_pages(["wifi"])
+
+    def on_setting(self, key, value):
+        self.ctl.settings[key] = value
+        self.ctl.save()
+
     def refresh_ports(self):
         ports = list_ports()
         self.port_map = {label: dev for dev, label, _ in ports}
@@ -364,6 +550,13 @@ class App:
         self.usage_tick()   # sends now when ticked; cancels the pending one when not
 
     # ── actions ───────────────────────────────────────────
+    def tick_clock(self):
+        time_s, weekday, day = bp.clock_page(dt.datetime.now())
+        self.page_labels[("clock", "time")].configure(text=time_s)
+        self.page_labels[("date", "weekday")].configure(text=weekday)
+        self.page_labels[("date", "day")].configure(text=day)
+        self.root.after(1000, self.tick_clock)
+
     def set_status(self, key):
         problem = self.ctl.target_problem()
         if problem:
@@ -380,20 +573,30 @@ class App:
         """Reads the logs again and shows them; sends nothing."""
         threading.Thread(target=lambda: self.events.put(("read", self.ctl.read_usage())), daemon=True).start()
 
-    def show_usage(self, body):
-        for name in ("claude", "codex"):
-            t = body.get(name)
-            if not t:
-                continue
-            self.cells[(name, "today")].configure(text=f"{short_tokens(t['today'])}   ${t.get('today_usd', 0):.2f}")
-            self.cells[(name, "week")].configure(text=f"{short_tokens(t['week'])}   ${t.get('week_usd', 0):.2f}")
-            if "month" in t:
-                self.cells[(name, "month")].configure(text=f"{short_tokens(t['month'])}   ${t.get('month_usd', 0):.2f}")
-                self.cells[(name, "bar")].set(month_fraction(t))
-            self.cells[(name, "limit")].configure(
-                text="  ".join(x for x in (("Month " + month_text(t)) if t.get("month_limit_usd") else "",
-                                           limit_text(t)) if x))
-        self.usage_line.configure(text=f"Read at {time.strftime('%H:%M:%S')}")
+    def refresh_network_pages(self, keys=None):
+        """Weather, stock, GitHub and Wi-Fi, each in its own thread. Without `keys` it is the
+        three that come from the internet, and again every 10 minutes."""
+        for key in keys or ("weather", "stock", "github"):
+            threading.Thread(target=self.page_worker, args=(key,), daemon=True).start()
+        if keys is None:
+            self.root.after(REFRESH_SECONDS * 1000, self.refresh_network_pages)
+
+    def page_worker(self, key):
+        try:
+            self.events.put(("page", key, self.ctl.fetch_page(key), None))
+        except bp.FetchError as e:
+            self.events.put(("page", key, None, str(e)))
+        except Exception as e:   # a page must never take the app down
+            self.events.put(("page", key, None, f"{type(e).__name__}: {e}"))
+
+    def load_from_buddy(self):
+        def work():
+            try:
+                self.ctl.load_from_buddy()
+                self.events.put(("loaded", None))
+            except bp.FetchError as e:
+                self.events.put(("loaded", str(e)))
+        threading.Thread(target=work, daemon=True).start()
 
     def send_usage_now(self):
         problem = self.ctl.target_problem()
@@ -417,7 +620,54 @@ class App:
             threading.Thread(target=self.usage_worker, daemon=True).start()
         self.tick_id = self.root.after(int(self.interval.get()) * 1000, self.usage_tick)
 
-    # ── results back on the UI thread ─────────────────────
+    # ── showing results (UI thread) ───────────────────────
+    def show_page(self, key, d, error):
+        L = self.page_labels
+        err = L.get((key, "error"))
+        if error:
+            if err:
+                err.configure(text=error)
+            return
+        if err:
+            err.configure(text="")
+        stamp = time.strftime("%H:%M:%S")
+        if key == "weather":
+            L[("weather", "temp")].configure(text=f"{d['temp']}°{d['unit']}")
+            L[("weather", "text")].configure(text=d["text"].title() + ("" if d["is_day"] else "  (night)"))
+            L[("weather", "more")].configure(
+                text=f"Humidity {d['humidity']}%   Wind {d['wind']} {d['wind_unit']}   (read {stamp})")
+        elif key == "github":
+            L[("github", "followers")].configure(text=f"{d['followers']:,} followers")
+            L[("github", "repos")].configure(text=f"{d['repos']:,} public repos   (read {stamp})")
+        elif key == "stock":
+            L[("stock", "price")].configure(text=f"${d['price']:,.2f}")
+            L[("stock", "more")].configure(
+                text=f"{d['change_pct']:+.2f}% today   open {d['open']:,.2f}   "
+                     f"high {d['high']:,.2f}   low {d['low']:,.2f}   (read {stamp})")
+        elif key == "wifi":
+            L[("wifi", "ssid")].configure(text=d["ssid"] or ("(network name: read over USB)" if d["ip"] else "-"))
+            L[("wifi", "ip")].configure(text=d["ip"] or "not connected")
+            bits = [] if d["connected"] else ["Not connected to Wi-Fi."]
+            if d.get("rssi") is not None:
+                bits.append(f"Signal {d['rssi']} dBm")
+            bits.append(f"read {stamp}")
+            L[("wifi", "more")].configure(text="   ".join(bits))
+
+    def show_usage(self, body):
+        for name in ("claude", "codex"):
+            t = body.get(name)
+            if not t:
+                continue
+            self.cells[(name, "today")].configure(text=f"{short_tokens(t['today'])}   ${t.get('today_usd', 0):.2f}")
+            self.cells[(name, "week")].configure(text=f"{short_tokens(t['week'])}   ${t.get('week_usd', 0):.2f}")
+            if "month" in t:
+                self.cells[(name, "month")].configure(text=f"{short_tokens(t['month'])}   ${t.get('month_usd', 0):.2f}")
+                self.cells[(name, "bar")].set(month_fraction(t))
+            self.cells[(name, "limit")].configure(
+                text="  ".join(x for x in (("Month " + month_text(t)) if t.get("month_limit_usd") else "",
+                                           limit_text(t)) if x))
+            self.page_labels[(name, "read")].configure(text=f"Read at {time.strftime('%H:%M:%S')}")
+
     def drain(self):
         try:
             while True:
@@ -432,6 +682,16 @@ class App:
                     self.mark()
                 elif ev[0] == "read":
                     self.show_usage(ev[1])
+                elif ev[0] == "page":
+                    self.show_page(*ev[1:])
+                elif ev[0] == "loaded":
+                    if ev[1]:
+                        self.say(ev[1])
+                    else:
+                        for key in ("lat", "lon", "github_user", "ticker"):
+                            self.vars[key].set(str(self.ctl.settings[key]))
+                        self.say("Copied location, GitHub user and ticker from the Buddy.")
+                        self.refresh_network_pages(["weather", "github", "stock"])
                 else:
                     _, ok, msg, body = ev
                     self.show_usage(body)

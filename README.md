@@ -83,7 +83,7 @@ The last page is a status board: the word fills the screen on a colour, **FREE**
 
 ### Desktop app (optional)
 
-A small window for the two features above, so nothing has to be typed: pick the USB port (a Buddy is picked for you) or enter its Wi-Fi address, click **Free**, **Busy** or **In a meeting**, and tick **Send usage every 60 seconds** to keep the Claude and Codex pages current.
+A small window with one entry for every page the Buddy shows (Face, Clock, Date, Weather, Stock, GitHub, Claude, Codex, Status, Wi-Fi) and its numbers. Pick the USB port (a Buddy is picked for you) or enter its Wi-Fi address, click **Free**, **Busy** or **In a meeting** on the Status page, and tick **Send usage every 60 seconds** to keep the Claude and Codex pages current. The Buddy fetches its own weather, GitHub and stock numbers, so the app asks the same services with the same settings: **Load from Buddy** (USB) copies the location, GitHub user and ticker from it, and the Stock page needs your Finnhub key typed in (kept in `~/.monitor-buddy-app.json`, plain text). The Wi-Fi page shows the network name and IP address the Buddy reports over USB.
 
 - **Windows:** `MonitorBuddy.exe`. **macOS:** `MonitorBuddy.dmg`, drag the app to Applications. Both are built by the *Desktop app* workflow: open the run in the **Actions** tab and download them from **Artifacts**.
 - The apps are not code-signed, so the first start gets a warning. Windows: **More info → Run anyway**. macOS: right-click the app → **Open** → **Open** (or allow it under System Settings → Privacy & Security).
