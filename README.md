@@ -65,7 +65,7 @@ The firmware also builds for the **Waveshare ESP32-S3-Touch-LCD-1.47**, which ha
 
 ### Claude and Codex usage pages (optional)
 
-Two extra pages show how many tokens **Claude Code** and **Codex** used on your computer today and over the last 7 days. They appear by themselves once a computer starts pushing numbers to the Buddy, and are gone again after a restart. Codex also fills a limit bar when its log has rate-limit percentages (some plans do not); Claude Code keeps none locally, so its page shows tokens only.
+Two extra pages show how many tokens **Claude Code** and **Codex** used on your computer today and over the last 7 days, with an estimate in dollars, and a **MONTH** bar: dollars spent this calendar month against a monthly budget (default $400 for each, `--month-limit` on the tool or *Monthly limit* in the desktop app). They appear by themselves once a computer starts pushing numbers to the Buddy, and are gone again after a restart. Codex also fills a limit bar when its log has rate-limit percentages (some plans do not); Claude Code keeps none locally, so its page shows tokens only.
 
 1. Find the Buddy's address in the serial log (`usage: listening on http://<ip>:8080/usage`), or in your router's device list.
 2. On the computer that runs Claude Code and Codex: `python tools/usage_push.py <ip>`. It needs only Python 3 and sends an update every 60 seconds. `--once` sends one, `--dry-run` shows what would be sent.
