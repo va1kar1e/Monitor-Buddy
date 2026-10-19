@@ -63,6 +63,24 @@ The firmware also builds for the **Waveshare ESP32-S3-Touch-LCD-1.47**, which ha
 - **The BOOT button** is on a different pin but does the same job (see [4.10](#410-everyday-controls)).
 - **The printed holder** was designed for the C6 board. Check the S3 board's size against it before printing.
 
+### Claude and Codex usage pages (optional)
+
+Two extra pages show how many tokens **Claude Code** and **Codex** used on your computer today and over the last 7 days. They appear by themselves once a computer starts pushing numbers to the Buddy, and are gone again after a restart. Codex also fills a limit bar when its log has rate-limit percentages (some plans do not); Claude Code keeps none locally, so its page shows tokens only.
+
+1. Find the Buddy's address in the serial log (`usage: listening on http://<ip>:8080/usage`), or in your router's device list.
+2. On the computer that runs Claude Code and Codex: `python tools/usage_push.py <ip>`. It needs only Python 3 and sends an update every 60 seconds. `--once` sends one, `--dry-run` shows what would be sent.
+
+No Wi-Fi, or no wish to pair? Use the USB cable instead: `pip install pyserial`, then `python tools/usage_push.py --serial COM11` (your Buddy's port). It needs no address and no token, and opens the port only for each push, so the web flasher still works in between.
+
+Over Wi-Fi the first push pairs the Buddy with a random token stored in `~/.monitor-buddy-usage-token`; any other computer is then refused. The numbers travel as plain HTTP on your own network, so use this only on a network you trust. To pair a different computer, erase the Buddy's settings storage once: `esptool --port <port> erase-region 0x9000 0x5000` (Wi-Fi and display settings are kept, they are in LittleFS).
+
+### Free / Busy / In a meeting page (optional)
+
+The last page is a status board: the word fills the screen on a colour, **FREE** (green), **BUSY** (red) or **IN A MEETING** (yellow). It starts as Free after every restart.
+
+- **On the Buddy:** tap the page to step Free → Busy → In a meeting. Swipe still changes page.
+- **From your computer:** `python tools/status_push.py --serial COM11 busy` (or `free`, `meeting`) over the USB cable, or `python tools/status_push.py <ip> busy` over Wi-Fi with the same pairing as the usage pages. This works from a hotkey, a Stream Deck button or a script.
+
 ---
 
 ## 3. Assembly
