@@ -2,7 +2,7 @@
 // Monitor-Buddy — Waveshare ESP32-C6-Touch-LCD-1.47
 //                 and ESP32-S3-Touch-LCD-1.47 (see lib/board/board_pins.h)
 // by IdefixRC - https://github.com/IdefixRC
-// Features: animated faces, clock, date, weather, moon,
+// Features: animated faces, clock, date, weather,
 //           stock ticker, GitHub stats.  
 //           5 different themes available,
 //           Enable/Disable pages to customize your Buddy
@@ -292,14 +292,13 @@ void drawDigit(int x, int y, uint8_t digit, int w, int h, int t, uint16_t color)
 void drawClock();
 void drawDatePage();
 void drawWeather();
-void drawMoonDisc(int cx, int cy, int radius, float phase, uint16_t color);
-void drawMoon();
 void drawStock();
 void drawGithub();
 void drawUsagePage(const char *title, uint16_t accent, const UsageSlot &u);
 void drawClaude();
 void drawCodex();
 void drawStatus();
+void drawNetInfo();
 void serviceUsageServer();
 void triggerFaceTap();
 void readSensors();
@@ -570,7 +569,7 @@ bool bsp_touch_get_coordinates(uint16_t *outX, uint16_t *outY) {
 
 static const int SCREEN_W         = 320;
 static const int SCREEN_H         = 172;
-static const uint8_t APP_COUNT    = 10;   // total number of pages defined
+static const uint8_t APP_COUNT    = 11;   // total number of pages defined
 
 // Page identifiers, in fixed display order. These index the render switch in
 // loop(); which are actually shown is decided by settings.pages.
@@ -578,6 +577,8 @@ static constexpr uint8_t PAGE_FACE    = 0;
 static constexpr uint8_t PAGE_CLOCK   = 1;
 static constexpr uint8_t PAGE_DATE    = 2;
 static constexpr uint8_t PAGE_WEATHER = 3;
+// The moon page was removed. Its id and the "moon" setting stay, so settings.pages[]
+// keeps its indexes and an old /config.json still loads; nothing shows it.
 static constexpr uint8_t PAGE_MOON    = 4;
 static constexpr uint8_t PAGE_STOCK   = 5;
 static constexpr uint8_t PAGE_GITHUB  = 6;
@@ -589,6 +590,8 @@ static constexpr uint8_t PAGE_CODEX   = 8;
 // Set from a PC (@MB STATUS, POST /status) or by tapping the page; kept in RAM
 // only, so a restart goes back to Free.
 static constexpr uint8_t PAGE_STATUS  = 9;
+// Last page: the Wi-Fi network and the Buddy's IP address. Always shown.
+static constexpr uint8_t PAGE_NETINFO = 10;
 
 // -- Face expressions (ported from DESKBUDDY-1.0, Edison Science Corner) --
 // 9 moods, cycled by single-tapping the face page. A fast spin of the board
@@ -624,8 +627,8 @@ bool settingsStored = false;   // booted from a readable /config.json; GET "stor
 static_assert(PAGE_FACE == 0 && PAGE_CLOCK == 1 && PAGE_DATE == 2 &&
               PAGE_WEATHER == 3 && PAGE_MOON == 4 && PAGE_STOCK == 5 &&
               PAGE_GITHUB == 6, "settings.pages[] is indexed by PAGE_* ids");
-static_assert(SETTINGS_PAGE_COUNT + 3 == APP_COUNT,
-              "settings.pages[] needs one entry per page, except the usage and status pages");
+static_assert(SETTINGS_PAGE_COUNT + 4 == APP_COUNT,
+              "settings.pages[] needs one entry per page, except the usage, status and network pages");
 
 Arduino_DataBus *bus     = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI);
 Arduino_GFX    *display  = new Arduino_ST7789(bus, LCD_RST, 0, false, 172, 320, 34, 0, 34, 0);
@@ -724,7 +727,7 @@ void snapshotNetData() {
 
 // Themed colours, assigned once by applyTheme() from settings.theme.
 uint16_t COL_TIME, COL_SEC, COL_DATE_WD, COL_DATE_BIG, COL_VALUE, COL_LABEL;
-uint16_t COL_TEMP, COL_WICON, COL_WSUB, COL_MOON, COL_MOONLAB;
+uint16_t COL_TEMP, COL_WICON, COL_WSUB;
 uint16_t COL_PRICE_UP, COL_PRICE_DOWN, COL_TICKER, COL_GHLOGO, COL_GHNUM;
 
 // ── Helpers ────────────────────────────────────────────────
@@ -739,21 +742,21 @@ uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
 void applyTheme() {
   uint16_t W = FG;
   COL_TIME=COL_SEC=COL_DATE_WD=COL_DATE_BIG=COL_VALUE=COL_LABEL=W;
-  COL_TEMP=COL_WICON=COL_WSUB=W;  COL_MOON=W;  COL_MOONLAB=W;
+  COL_TEMP=COL_WICON=COL_WSUB=W;
   COL_PRICE_UP=COL_PRICE_DOWN=COL_TICKER=COL_GHLOGO=COL_GHNUM=W;
   switch (settings.theme) {
     case 1: {
       uint16_t CY=rgb(0,200,255), GRAY=rgb(120,130,140);
-      COL_SEC=CY; COL_DATE_WD=CY; COL_TEMP=CY; COL_MOONLAB=CY;
+      COL_SEC=CY; COL_DATE_WD=CY; COL_TEMP=CY;
       COL_PRICE_UP=COL_PRICE_DOWN=CY; COL_GHNUM=CY;
-      COL_LABEL=GRAY; COL_WSUB=GRAY; COL_MOON=rgb(220,220,220);
+      COL_LABEL=GRAY; COL_WSUB=GRAY;
       break;
     }
     case 2: {
       uint16_t GRAY=rgb(120,130,140);
       COL_SEC=rgb(255,180,40); COL_DATE_WD=rgb(255,180,40);
       COL_TEMP=rgb(255,140,60); COL_WICON=rgb(255,210,90); COL_WSUB=rgb(60,200,200);
-      COL_MOON=rgb(255,210,90); COL_MOONLAB=rgb(0,200,255);
+
       COL_PRICE_UP=rgb(60,220,120); COL_PRICE_DOWN=rgb(255,80,90);
       COL_GHNUM=rgb(60,220,120); COL_LABEL=GRAY;
       break;
@@ -763,7 +766,7 @@ void applyTheme() {
       COL_TIME=AM; COL_SEC=GO; COL_DATE_WD=AM; COL_DATE_BIG=CR;
       COL_VALUE=rgb(235,215,180); COL_LABEL=rgb(150,120,80);
       COL_TEMP=AM; COL_WICON=GO; COL_WSUB=rgb(180,150,110);
-      COL_MOON=GO; COL_MOONLAB=AM;
+
       COL_PRICE_UP=COL_PRICE_DOWN=AM; COL_TICKER=CR; COL_GHLOGO=CR; COL_GHNUM=AM;
       break;
     }
@@ -773,7 +776,7 @@ void applyTheme() {
       COL_TIME=CY; COL_SEC=TE; COL_DATE_WD=BL; COL_DATE_BIG=LG;
       COL_VALUE=LG; COL_LABEL=SL;
       COL_TEMP=CY; COL_WICON=BL; COL_WSUB=TE;
-      COL_MOON=rgb(210,225,245); COL_MOONLAB=CY;
+
       COL_PRICE_UP=COL_PRICE_DOWN=CY; COL_TICKER=LG; COL_GHLOGO=LG; COL_GHNUM=CY;
       break;
     }
@@ -972,6 +975,7 @@ void buildPageList() {
   pageCount = 0;
   for (uint8_t i = 0; i < SETTINGS_PAGE_COUNT; i++) {
     if (!settings.pages[i]) continue;
+    if (i == PAGE_MOON) continue;                           // removed
     if (i == PAGE_GITHUB && !githubConfigured()) continue;  // "" hides the page
     if (i == PAGE_STOCK && !stockConfigured()) continue;    // no key hides the page
     pageOrder[pageCount++] = i;
@@ -980,6 +984,7 @@ void buildPageList() {
   if (netShared.codex.valid)  pageOrder[pageCount++] = PAGE_CODEX;
   if (pageCount == 0) pageOrder[pageCount++] = PAGE_FACE;  // never leave it empty
   pageOrder[pageCount++] = PAGE_STATUS;
+  pageOrder[pageCount++] = PAGE_NETINFO;
   if (currentPageIdx >= pageCount) currentPageIdx = 0;
   currentApp = pageOrder[currentPageIdx];
 }
@@ -1720,54 +1725,6 @@ void drawWeather() {
   drawPageDots();
 }
 
-// ── Moon phase page ───────────────────────────────────────
-
-const char *moonPhaseLabel(float phase) {
-  if (phase<0.03f||phase>0.97f) return "NEW MOON";
-  if (phase<0.22f)              return "WAXING CRESCENT";
-  if (phase<0.28f)              return "FIRST QUARTER";
-  if (phase<0.47f)              return "WAXING GIBBOUS";
-  if (phase<0.53f)              return "FULL MOON";
-  if (phase<0.72f)              return "WANING GIBBOUS";
-  if (phase<0.78f)              return "LAST QUARTER";
-  return "WANING CRESCENT";
-}
-
-void drawMoonDisc(int cx, int cy, int radius, float phase, uint16_t color) {
-  phase = phase - floor(phase);
-  gfx->drawCircle(cx, cy, radius+3, rgb(72,72,72));
-  gfx->fillCircle(cx, cy, radius, color);
-  if (phase<0.03f||phase>0.97f) {
-    gfx->fillCircle(cx, cy, radius-2, BG);
-    gfx->drawCircle(cx, cy, radius, color);
-    return;
-  }
-  if (phase>0.47f && phase<0.53f) return;
-  int shadowX = (phase < 0.5f)
-    ? cx - (int)(4.0f*radius*phase)
-    : cx + (int)(2.0f*radius - 4.0f*radius*(phase-0.5f));
-  gfx->fillCircle(shadowX, cy, radius, BG);
-  gfx->drawCircle(cx, cy, radius, color);
-}
-
-void drawMoon() {
-  const float syn = 29.53058867f;
-  uint32_t elapsed = (millis()-clockStartMillis)/1000UL;
-  float days = (float)clockStartDays + ((float)clockStartSeconds+(float)elapsed)/86400.0f;
-  float age  = fmod(days-10962.7597f, syn);
-  if (age < 0.0f) age += syn;
-  float phase       = age/syn;
-  int   illumination = (int)round((1.0f-cos(phase*6.2831853f))*50.0f);
-  gfx->fillScreen(BG);
-  drawMoonDisc(240, 74, 58, phase, COL_MOON);
-  gfx->setTextSize(2); gfx->setTextColor(COL_MOONLAB);
-  gfx->setCursor(10, 24);  gfx->print(moonPhaseLabel(phase));
-  gfx->setTextColor(COL_VALUE);
-  gfx->setCursor(10, 92);  gfx->print("AGE "); gfx->print(age, 1); gfx->print(" DAYS");
-  gfx->setCursor(10, 120); gfx->print("LIGHT "); gfx->print(illumination); gfx->print("%");
-  drawPageDots();
-}
-
 // ── Stock page ────────────────────────────────────────────
 
 void drawStock() {
@@ -1841,16 +1798,20 @@ void drawGithub() {
 static constexpr uint32_t USAGE_STALE_MS = 30UL * 60UL * 1000UL;
 
 // Limit bar: blue under 70 %, yellow from 70 %, red from 90 % (CP AXTRA palette).
-static void drawUsageBar(int y, const char *label, int pct) {
+// `right` is the text after the bar; null shows the percentage. A bar past 100 %
+// stays full.
+static void drawUsageBar(int y, const char *label, int pct, const char *right = nullptr) {
   const uint16_t col = pct >= 90 ? rgb(218,56,50) : pct >= 70 ? rgb(246,194,74) : rgb(48,111,199);
   gfx->setTextSize(1); gfx->setTextColor(COL_LABEL);
   gfx->setCursor(14, y + 2); gfx->print(label);
-  const int bx = 54, bw = 210, bh = 10;
+  const int bx = 54, bw = 170, bh = 10;
   gfx->fillRoundRect(bx, y, bw, bh, 3, rgb(40,40,40));
-  if (pct > 0) gfx->fillRoundRect(bx, y, max(6, bw * pct / 100), bh, 3, col);
-  char buf[8]; snprintf(buf, sizeof(buf), "%d%%", pct);
+  const int shown = constrain(pct, 0, 100);
+  if (shown > 0) gfx->fillRoundRect(bx, y, max(6, bw * shown / 100), bh, 3, col);
+  char buf[16];
+  if (!right) { snprintf(buf, sizeof(buf), "%d%%", pct); right = buf; }
   gfx->setTextColor(COL_VALUE);
-  gfx->setCursor(bx + bw + 8, y + 2); gfx->print(buf);
+  gfx->setCursor(bx + bw + 8, y + 2); gfx->print(right);
 }
 
 void drawUsagePage(const char *title, uint16_t accent, const UsageSlot &u) {
@@ -1883,13 +1844,22 @@ void drawUsagePage(const char *title, uint16_t accent, const UsageSlot &u) {
     gfx->setCursor(200, 76); gfx->print(buf);
   }
 
-  if (u.pct1 < 0 && u.pct2 < 0) {
+  const bool hasMonth = u.monthUsd >= 0 && u.monthLimitUsd > 0;
+  if (u.pct1 < 0 && u.pct2 < 0 && !hasMonth) {
     gfx->setCursor(14, 112); gfx->print("NO LIMIT DATA");
   } else {
     int y = 104;
-    if (u.pct1 >= 0) { drawUsageBar(y, "LIMIT", u.pct1); y += 18; }
-    if (u.pct2 >= 0) { drawUsageBar(y, "WEEK", u.pct2); y += 18; }
-    if (u.reset1 >= 0) {
+    int bars = 0;
+    if (hasMonth) {
+      // Dollars this month against the monthly budget, e.g. "$126/$400".
+      char dollars[20];
+      snprintf(dollars, sizeof(dollars), "$%ld/$%ld", (long)u.monthUsd, (long)u.monthLimitUsd);
+      drawUsageBar(y, "MONTH", (int)(u.monthUsd * 100.0f / u.monthLimitUsd), dollars);
+      y += 18; bars++;
+    }
+    if (u.pct1 >= 0) { drawUsageBar(y, "LIMIT", u.pct1); y += 18; bars++; }
+    if (u.pct2 >= 0) { drawUsageBar(y, "WEEK", u.pct2); y += 18; bars++; }
+    if (u.reset1 >= 0 && bars < 3) {   // no room under three bars: the page dots sit there
       char r[20]; formatReset(u.reset1, r, sizeof(r));
       gfx->setTextSize(1); gfx->setTextColor(COL_LABEL);
       gfx->setCursor(14, y + 2); gfx->print("RESETS IN "); gfx->print(r);
@@ -1922,6 +1892,29 @@ void drawStatus() {
     gfx->setTextSize(8);
     gfx->setCursor((SCREEN_W - (int)strlen(w) * 48) / 2, 46); gfx->print(w);
   }
+  drawPageDots();
+}
+
+// ── Network page ──────────────────────────────────────────
+// The Wi-Fi network the Buddy joined and its IP address, so the address for
+// tools/usage_push.py can be read off the screen.
+void drawNetInfo() {
+  gfx->fillScreen(BG);
+  centeredTextColor("WI-FI", 8, 2, rgb(48,111,199));
+  if (!wifiManager.isConnected()) {
+    centeredText("NOT CONNECTED", 66, 2);
+    drawPageDots();
+    return;
+  }
+  const String ssid = WiFi.SSID();
+  const String ip   = WiFi.localIP().toString();
+  centeredTextColor("NETWORK", 36, 1, COL_LABEL);
+  centeredFit(ssid.c_str(), 50, 3);
+  centeredTextColor("IP ADDRESS", 88, 1, COL_LABEL);
+  centeredFit(ip.c_str(), 102, 3);
+  char sig[24];
+  snprintf(sig, sizeof(sig), "SIGNAL %d dBm", (int)wifiManager.getSignalStrength());
+  centeredTextColor(sig, 138, 1, COL_LABEL);
   drawPageDots();
 }
 
@@ -2299,7 +2292,10 @@ void mbInfo() {
   w["ssid"]  = (const char *)ssid;
   bool up = !wifiManager.isPortalActive() && wifiManager.isConnected();
   w["connected"] = up;
-  if (up) w["rssi"] = wifiManager.getSignalStrength();
+  if (up) {
+    w["rssi"] = wifiManager.getSignalStrength();
+    w["ip"]   = WiFi.localIP().toString();
+  }
   mbReply(true, doc);
 }
 
@@ -2923,12 +2919,12 @@ void loop() {
     case 1: drawClock();      break;
     case 2: drawDatePage();   break;
     case 3: drawWeather();    break;
-    case 4: drawMoon();       break;
     case 5: drawStock();      break;
     case 6: drawGithub();     break;
     case 7: drawClaude();     break;
     case 8: drawCodex();      break;
-    default: drawStatus();    break;
+    case 9: drawStatus();     break;
+    default: drawNetInfo();   break;
   }
   // Brightness or auto-advance feedback banner — shown briefly after a gesture.
   if (millis() < brightnessBannerUntil) {

@@ -64,8 +64,17 @@ bool parseSlot(JsonVariantConst obj, UsageSlot &slot, const char **error,
     *error = msg;
     return false;
   }
+  float mu, ml;
+  if (!readOptionalFloat(obj, "month_usd", 1e7, mu) || !readOptionalFloat(obj, "month_limit_usd", 1e7, ml) ||
+      (ml != -1 && ml < 1)) {
+    snprintf(msg, sizeof(msg), "%s: month_usd 0+, month_limit_usd 1+", name);
+    *error = msg;
+    return false;
+  }
   slot.todayUsd = tu;
   slot.weekUsd  = wu;
+  slot.monthUsd = mu;
+  slot.monthLimitUsd = ml;
   slot.valid = true;
   slot.today = (float)today;
   slot.week  = (float)week;

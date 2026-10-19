@@ -99,6 +99,20 @@ void test_status_labels() {
   TEST_ASSERT_EQUAL_STRING("", statusLabel(STATUS_COUNT));
 }
 
+void test_parse_month() {
+  UsageSlot c = {}, x = {}; bool hc, hx; const char *err;
+  TEST_ASSERT_TRUE(parse("{\"codex\":{\"today\":1,\"week\":2,\"month_usd\":348.9,\"month_limit_usd\":400}}",
+                         c, hc, x, hx, &err));
+  TEST_ASSERT_EQUAL_FLOAT(348.9f, x.monthUsd);
+  TEST_ASSERT_EQUAL_FLOAT(400, x.monthLimitUsd);
+  TEST_ASSERT_TRUE(parse("{\"codex\":{\"today\":1,\"week\":2}}", c, hc, x, hx, &err));
+  TEST_ASSERT_EQUAL_FLOAT(-1, x.monthUsd);
+  TEST_ASSERT_EQUAL_FLOAT(-1, x.monthLimitUsd);
+  // A limit under $1 would divide into nonsense percentages.
+  TEST_ASSERT_FALSE(parse("{\"codex\":{\"today\":1,\"week\":2,\"month_limit_usd\":0}}", c, hc, x, hx, &err));
+  TEST_ASSERT_FALSE(parse("{\"codex\":{\"today\":1,\"week\":2,\"month_usd\":-5}}", c, hc, x, hx, &err));
+}
+
 void test_reset_format() {
   char b[16];
   formatReset(5, b, sizeof(b));    TEST_ASSERT_EQUAL_STRING("5 m", b);
@@ -162,6 +176,7 @@ int main() {
   RUN_TEST(test_status_parse);
   RUN_TEST(test_status_parse_rejects_without_changing_state);
   RUN_TEST(test_status_labels);
+  RUN_TEST(test_parse_month);
   RUN_TEST(test_reset_format);
   RUN_TEST(test_parse_both);
   RUN_TEST(test_parse_one_provider_leaves_other);
