@@ -108,6 +108,93 @@ class Pages(unittest.TestCase):
             controller(mode="wifi", host="1.2.3.4").load_from_buddy()
 
 
+class WifiProfiles(unittest.TestCase):
+    def test_rules_match_the_buddy(self):
+        self.assertIsNone(ba.wifi_problem("Home", "password1"))
+        self.assertIsNone(ba.wifi_problem("Cafe", ""))                 # an open network
+        self.assertIsNotNone(ba.wifi_problem("", "password1"))
+        self.assertIsNotNone(ba.wifi_problem("x" * 33, "password1"))
+        self.assertIsNotNone(ba.wifi_problem("Home", "short"))
+        self.assertIsNotNone(ba.wifi_problem("Home", "p" * 64))
+
+    def test_add_edit_delete_and_persist(self):
+        c = controller()
+        self.assertIsNone(c.save_profile("Office", "password1", True))
+        self.assertIsNone(c.save_profile("Home", "password2", True))
+        self.assertEqual([p["ssid"] for p in c.profiles()], ["Home", "Office"])          # sorted
+        self.assertIn("already", c.save_profile("Home", "password3", True))              # add twice
+        self.assertIsNone(c.save_profile("Home2", "password4", True, replacing="Home"))  # rename
+        self.assertEqual([p["ssid"] for p in c.profiles()], ["Home2", "Office"])
+        self.assertEqual(ba.Controller(c.path).profiles()[0]["password"], "password4")  # saved
+        c.delete_profile("Office")
+        self.assertEqual([p["ssid"] for p in ba.Controller(c.path).profiles()], ["Home2"])
+
+    def test_password_not_stored_unless_asked(self):
+        c = controller()
+        c.save_profile("Guest", "password1", False)
+        p = ba.Controller(c.path).profiles()[0]
+        self.assertEqual((p["password"], p["remember"]), ("", False))
+        self.assertNotIn("password1", c.path.read_text())
+
+    def test_invalid_network_is_refused_and_not_saved(self):
+        c = controller()
+        self.assertIsNotNone(c.save_profile("Home", "short", True))
+        self.assertEqual(c.profiles(), [])
+
+    def test_profiles_are_not_shared_between_controllers(self):
+        a, b = controller(), controller()
+        a.save_profile("Home", "password1", True)
+        self.assertEqual(b.profiles(), [])
+
+
+class SetupOverUsb(unittest.TestCase):
+    def test_wifi_goes_to_set_and_needs_usb(self):
+        c = controller(mode="usb", port="COM11")
+        with mock.patch.object(up, "serial_command", return_value=({"ok": True, "cmd": "SET"}, "")) as sc:
+            self.assertEqual(c.send_wifi("Home", "password1"), (True, ""))
+        self.assertEqual(sc.call_args[0][:3], ("COM11", "SET", {"wifi": {"ssid": "Home", "password": "password1"}}))
+        ok, msg = controller(mode="wifi", host="1.2.3.4").send_wifi("Home", "password1")
+        self.assertFalse(ok)
+        self.assertIn("USB", msg)
+
+    def test_bad_wifi_never_reaches_the_buddy(self):
+        c = controller(mode="usb", port="COM11")
+        with mock.patch.object(up, "serial_command") as sc:
+            ok, msg = c.send_wifi("Home", "short")
+        self.assertFalse(ok)
+        sc.assert_not_called()
+
+    def test_save_config_sends_only_the_changes_and_updates_the_app(self):
+        c = controller(mode="usb", port="COM11")
+        changes = {"lat": "1.5", "temp_unit": "fahrenheit", "wind_unit": "mph", "ticker": "MSFT",
+                   "stock_key": "KEY", "pages": {"stock": False}}
+        with mock.patch.object(up, "serial_command", return_value=({"ok": True, "cmd": "SET"}, "")) as sc:
+            self.assertEqual(c.save_buddy_config(changes), (True, ""))
+        self.assertEqual(sc.call_args[0][2], {"config": changes})
+        s = ba.Controller(c.path).settings
+        self.assertEqual((s["lat"], s["ticker"], s["finnhub_key"]), ("1.5", "MSFT", "KEY"))
+        self.assertTrue(s["fahrenheit"] and s["mph"])
+
+    def test_nothing_to_save(self):
+        ok, msg = controller(mode="usb", port="COM11").save_buddy_config({})
+        self.assertFalse(ok)
+        self.assertIn("Nothing", msg)
+
+    def test_the_buddys_complaints_are_shown_and_nothing_is_copied(self):
+        c = controller(mode="usb", port="COM11", lat="13.7563")
+        reply = {"ok": False, "cmd": "SET", "errors": {"lat": "must be -90 to 90", "ticker": "bad"}}
+        with mock.patch.object(up, "serial_command", return_value=(reply, "")):
+            ok, msg = c.save_buddy_config({"lat": "999", "ticker": "??"})
+        self.assertFalse(ok)
+        self.assertIn("lat: must be -90 to 90", msg)
+        self.assertEqual(c.settings["lat"], "13.7563")
+
+    def test_no_reply_is_reported(self):
+        c = controller(mode="usb", port="COM11")
+        with mock.patch.object(up, "serial_command", return_value=(None, "no reply")):
+            self.assertEqual(c.send_wifi("Home", "password1"), (False, "no reply"))
+
+
 class Colors(unittest.TestCase):
     def test_bar_color_thresholds(self):
         self.assertEqual(ba.bar_color(0.0), ba.BLUE)
@@ -208,7 +295,7 @@ class Window(unittest.TestCase):
             root.withdraw()
             app = ba.App(root, controller(), autostart=False)
             self.assertEqual(set(app.buttons), {"free", "busy", "meeting"})
-            self.assertEqual(app.listbox.size(), len(ba.bp.PAGES))
+            self.assertEqual(app.listbox.size(), len(ba.bp.PAGES) + 1)   # and Setup
             app.show_page("weather", {"temp": 31, "humidity": 70, "wind": 9, "text": "CLEAR", "is_day": True,
                                       "unit": "C", "wind_unit": "KMH"}, None)
             self.assertEqual(app.page_labels[("weather", "temp")].cget("text"), "31\u00b0C")
@@ -216,6 +303,19 @@ class Window(unittest.TestCase):
             self.assertEqual(app.page_labels[("stock", "error")].cget("text"), "set a Finnhub key")
             app.show_page("wifi", {"ssid": "Home", "ip": "192.168.1.186", "rssi": -52, "connected": True}, None)
             self.assertEqual(app.page_labels[("wifi", "ip")].cget("text"), "192.168.1.186")
+            app.fill_setup({"mount": "right", "theme": 2, "tz_name": "Asia/Bangkok", "tz_rule": "<+07>-7",
+                            "lat": "13.7", "lon": "100.5", "temp_unit": "celsius", "wind_unit": "kmh",
+                            "github_user": "octo", "ticker": "AVGO", "stock_key": "K",
+                            "pages": {"face": True, "stock": False}})
+            self.assertEqual(app.cfg_vars["theme"].get(), "2")
+            self.assertFalse(app.cfg_vars["pages.stock"].get())
+            self.assertEqual(app.cfg_dirty, set())          # filling is not editing
+            app.cfg_vars["ticker"].set("MSFT")
+            app.cfg_vars["theme"].set("3")
+            self.assertEqual(app.cfg_dirty, {"ticker", "theme"})
+            app.pick_tz(0)                                   # Bangkok preset
+            self.assertEqual(app.cfg_vars["tz_rule"].get(), "<+07>-7")
+            self.assertIn("tz_name", app.cfg_dirty)
             app.show_page("github", {"followers": 1234, "repos": 5}, None)
             self.assertEqual(app.page_labels[("github", "followers")].cget("text"), "1,234 followers")
             app.show_usage({"claude": {"today": 76217, "week": 123158, "today_usd": 3.88, "week_usd": 6.24},
