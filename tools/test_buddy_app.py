@@ -29,6 +29,36 @@ class Formatting(unittest.TestCase):
         self.assertEqual(ba.summary({}), "")
 
 
+class Month(unittest.TestCase):
+    def test_month_text_and_fraction(self):
+        t = {"month_usd": 348.947, "month_limit_usd": 400}
+        self.assertEqual(ba.month_text(t), "$348.95 of $400  (87%)")
+        self.assertAlmostEqual(ba.month_fraction(t), 0.8724, places=3)
+        self.assertEqual(ba.month_text({"month_usd": 12.5}), "$12.50")
+        self.assertEqual(ba.month_fraction({"month_usd": 12.5}), 0.0)
+        self.assertEqual(ba.month_fraction({"month_usd": 900, "month_limit_usd": 400}), 1.0)
+
+    def test_limit_setting_goes_into_the_body(self):
+        c = controller(month_limit=250)
+        with mock.patch.object(up, "build_body", return_value={}) as b:
+            c.read_usage()
+        self.assertEqual(b.call_args[1]["month_limit"], 250)
+        c = controller(month_limit=0)
+        with mock.patch.object(up, "build_body", return_value={}) as b:
+            c.read_usage()
+        self.assertIsNone(b.call_args[1]["month_limit"])
+
+
+class Colors(unittest.TestCase):
+    def test_bar_color_thresholds(self):
+        self.assertEqual(ba.bar_color(0.0), ba.BLUE)
+        self.assertEqual(ba.bar_color(0.69), ba.BLUE)
+        self.assertEqual(ba.bar_color(0.7), ba.YELLOW)
+        self.assertEqual(ba.bar_color(0.89), ba.YELLOW)
+        self.assertEqual(ba.bar_color(0.9), ba.RED)
+        self.assertEqual(ba.bar_color(1.0), ba.RED)
+
+
 class Limits(unittest.TestCase):
     def test_limit_text(self):
         self.assertEqual(ba.limit_text({"pct1": 42, "pct2": 17, "reset1": 134}), "Limit 42%  Week 17%  resets in 2 h 14 m")
@@ -121,10 +151,14 @@ class Window(unittest.TestCase):
             self.assertEqual(set(app.buttons), {"free", "busy", "meeting"})
             app.show_usage({"claude": {"today": 76217, "week": 123158, "today_usd": 3.88, "week_usd": 6.24},
                             "codex": {"today": 0, "week": 11094439, "today_usd": 0.0, "week_usd": 203.23,
+                                      "month": 15611974, "month_usd": 348.95, "month_limit_usd": 400,
                                       "pct1": 42, "reset1": 134}})
+            self.assertEqual(app.cells[("codex", "month")].cget("text"), "15.6M   $348.95")
+            self.assertAlmostEqual(app.cells[("codex", "bar")].fraction, 0.8724, places=3)
             self.assertEqual(app.cells[("claude", "today")].cget("text"), "76.2k   $3.88")
             self.assertEqual(app.cells[("codex", "week")].cget("text"), "11.0M   $203.23")
-            self.assertEqual(app.cells[("codex", "limit")].cget("text"), "Limit 42%  resets in 2 h 14 m")
+            self.assertEqual(app.cells[("codex", "limit")].cget("text"),
+                             "Month $348.95 of $400  (87%)  Limit 42%  resets in 2 h 14 m")
         finally:
             root.destroy()
 

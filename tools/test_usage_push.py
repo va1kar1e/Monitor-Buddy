@@ -142,6 +142,43 @@ class Cost(unittest.TestCase):
         self.assertIsNone(up.cost_usd(prices, "other", 5))
 
 
+class Month(unittest.TestCase):
+    def test_month_counts_this_calendar_month_only(self):
+        today = dt.date(2026, 10, 19)
+        def at(day, tokens):
+            local = dt.datetime.combine(day, dt.time(12)).astimezone()
+            return {"timestamp": local.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "requestId": str(day), "message": {"id": str(day), "usage": {"input_tokens": tokens, "output_tokens": 0}}}
+        with tempfile.TemporaryDirectory() as d:
+            write_jsonl(Path(d) / "s.jsonl", [
+                at(dt.date(2026, 10, 19), 1),      # today
+                at(dt.date(2026, 10, 14), 10),     # inside the 7 days and the month
+                at(dt.date(2026, 10, 1), 100),     # the month only
+                at(dt.date(2026, 9, 30), 1000),    # last month: inside the 7 days? no, 19 days back
+                at(dt.date(2026, 10, 20), 5),      # in the future: ignored
+            ])
+            got = up.claude_usage(Path(d), today)
+        self.assertEqual((got["today"], got["week"], got["month"]), (1, 11, 111))
+
+    def test_week_reaching_into_last_month_is_not_in_the_month(self):
+        today = dt.date(2026, 10, 3)
+        local = dt.datetime.combine(dt.date(2026, 9, 30), dt.time(12)).astimezone()
+        rec = {"timestamp": local.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+               "requestId": "r", "message": {"id": "m", "usage": {"input_tokens": 7, "output_tokens": 0}}}
+        with tempfile.TemporaryDirectory() as d:
+            write_jsonl(Path(d) / "s.jsonl", [rec])
+            got = up.claude_usage(Path(d), today)
+        self.assertEqual((got["week"], got["month"]), (7, 0))
+
+    def test_month_limit_is_sent_per_assistant(self):
+        with tempfile.TemporaryDirectory() as d:
+            body = up.build_body(None, TODAY, Path(d), Path(d), month_limit=400)
+            self.assertEqual(body["claude"]["month_limit_usd"], 400)
+            self.assertEqual(body["codex"]["month_limit_usd"], 400)
+            self.assertEqual(body["codex"]["month_usd"], 0.0)
+            self.assertNotIn("month_limit_usd", up.build_body(None, TODAY, Path(d), Path(d))["claude"])
+
+
 class Body(unittest.TestCase):
     def test_only_selects_one_assistant(self):
         with tempfile.TemporaryDirectory() as d:

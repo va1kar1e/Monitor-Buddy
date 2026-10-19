@@ -1841,16 +1841,20 @@ void drawGithub() {
 static constexpr uint32_t USAGE_STALE_MS = 30UL * 60UL * 1000UL;
 
 // Limit bar: blue under 70 %, yellow from 70 %, red from 90 % (CP AXTRA palette).
-static void drawUsageBar(int y, const char *label, int pct) {
+// `right` is the text after the bar; null shows the percentage. A bar past 100 %
+// stays full.
+static void drawUsageBar(int y, const char *label, int pct, const char *right = nullptr) {
   const uint16_t col = pct >= 90 ? rgb(218,56,50) : pct >= 70 ? rgb(246,194,74) : rgb(48,111,199);
   gfx->setTextSize(1); gfx->setTextColor(COL_LABEL);
   gfx->setCursor(14, y + 2); gfx->print(label);
-  const int bx = 54, bw = 210, bh = 10;
+  const int bx = 54, bw = 170, bh = 10;
   gfx->fillRoundRect(bx, y, bw, bh, 3, rgb(40,40,40));
-  if (pct > 0) gfx->fillRoundRect(bx, y, max(6, bw * pct / 100), bh, 3, col);
-  char buf[8]; snprintf(buf, sizeof(buf), "%d%%", pct);
+  const int shown = constrain(pct, 0, 100);
+  if (shown > 0) gfx->fillRoundRect(bx, y, max(6, bw * shown / 100), bh, 3, col);
+  char buf[16];
+  if (!right) { snprintf(buf, sizeof(buf), "%d%%", pct); right = buf; }
   gfx->setTextColor(COL_VALUE);
-  gfx->setCursor(bx + bw + 8, y + 2); gfx->print(buf);
+  gfx->setCursor(bx + bw + 8, y + 2); gfx->print(right);
 }
 
 void drawUsagePage(const char *title, uint16_t accent, const UsageSlot &u) {
@@ -1883,13 +1887,22 @@ void drawUsagePage(const char *title, uint16_t accent, const UsageSlot &u) {
     gfx->setCursor(200, 76); gfx->print(buf);
   }
 
-  if (u.pct1 < 0 && u.pct2 < 0) {
+  const bool hasMonth = u.monthUsd >= 0 && u.monthLimitUsd > 0;
+  if (u.pct1 < 0 && u.pct2 < 0 && !hasMonth) {
     gfx->setCursor(14, 112); gfx->print("NO LIMIT DATA");
   } else {
     int y = 104;
-    if (u.pct1 >= 0) { drawUsageBar(y, "LIMIT", u.pct1); y += 18; }
-    if (u.pct2 >= 0) { drawUsageBar(y, "WEEK", u.pct2); y += 18; }
-    if (u.reset1 >= 0) {
+    int bars = 0;
+    if (hasMonth) {
+      // Dollars this month against the monthly budget, e.g. "$126/$400".
+      char dollars[20];
+      snprintf(dollars, sizeof(dollars), "$%ld/$%ld", (long)u.monthUsd, (long)u.monthLimitUsd);
+      drawUsageBar(y, "MONTH", (int)(u.monthUsd * 100.0f / u.monthLimitUsd), dollars);
+      y += 18; bars++;
+    }
+    if (u.pct1 >= 0) { drawUsageBar(y, "LIMIT", u.pct1); y += 18; bars++; }
+    if (u.pct2 >= 0) { drawUsageBar(y, "WEEK", u.pct2); y += 18; bars++; }
+    if (u.reset1 >= 0 && bars < 3) {   // no room under three bars: the page dots sit there
       char r[20]; formatReset(u.reset1, r, sizeof(r));
       gfx->setTextSize(1); gfx->setTextColor(COL_LABEL);
       gfx->setCursor(14, y + 2); gfx->print("RESETS IN "); gfx->print(r);

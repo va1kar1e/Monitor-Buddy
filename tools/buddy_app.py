@@ -24,7 +24,8 @@ from tkinter import ttk
 import usage_push as up
 
 SETTINGS_PATH = Path("~/.monitor-buddy-app.json").expanduser()
-DEFAULTS = {"mode": "usb", "port": "", "host": "", "interval": 60, "auto_usage": False}
+DEFAULTS = {"mode": "usb", "port": "", "host": "", "interval": 60, "auto_usage": False,
+            "month_limit": 400}
 
 # CP AXTRA palette.
 BLUE, YELLOW, GREEN, RED = "#306FC7", "#F6C24A", "#43938F", "#DA3832"
@@ -66,6 +67,46 @@ def limit_text(t):
         parts.append("resets in " + (f"{m} m" if m < 60 else f"{m // 60} h {m % 60} m" if m < 1440
                                      else f"{m // 1440} d {m % 1440 // 60} h"))
     return "  ".join(parts)
+
+
+def month_text(t):
+    """'$126.40 of $400  (32%)' for a body entry, without the limit just '$126.40'."""
+    spent = t.get("month_usd", 0)
+    limit = t.get("month_limit_usd")
+    if not limit:
+        return f"${spent:.2f}"
+    return f"${spent:.2f} of ${limit:g}  ({spent / limit * 100:.0f}%)"
+
+
+def month_fraction(t):
+    """0..1 for the progress bar (clamped; over the limit still shows full)."""
+    limit = t.get("month_limit_usd")
+    return min(1.0, t.get("month_usd", 0) / limit) if limit else 0.0
+
+
+def bar_color(fraction):
+    """Blue under 70 %, yellow from 70 %, red from 90 % (the Buddy's bars)."""
+    return RED if fraction >= 0.9 else YELLOW if fraction >= 0.7 else BLUE
+
+
+class Bar(tk.Canvas):
+    """A flat progress bar: native ones cannot be coloured on every system."""
+
+    def __init__(self, parent):
+        super().__init__(parent, height=12, highlightthickness=0, bg="#DDDDDD")
+        self.fraction = 0.0
+        self.bind("<Configure>", lambda e: self.draw())
+
+    def set(self, fraction):
+        self.fraction = max(0.0, min(1.0, fraction))
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        if self.fraction > 0:
+            self.create_rectangle(0, 0, max(4, int(w * self.fraction)), 12, width=0,
+                                  fill=bar_color(self.fraction))
 
 
 def list_ports():
@@ -135,8 +176,9 @@ class Controller:
     def read_usage(self):
         """The usage found in the local Claude Code and Codex logs; sends nothing,
         so it works with no Buddy connected."""
+        limit = self.settings.get("month_limit") or None
         return up.build_body(None, dt.date.today(), Path("~/.claude/projects").expanduser(),
-                             Path("~/.codex/sessions").expanduser())
+                             Path("~/.codex/sessions").expanduser(), month_limit=limit)
 
     def send_usage(self):
         """(ok, message, body)."""
@@ -158,7 +200,7 @@ class App:
         self.buttons = {}
         self.port_map = {}           # combobox label -> device
         root.title("Monitor Buddy")
-        root.minsize(460, 640)
+        root.minsize(560, 700)
         self.build()
         self.refresh_ports()
         self.root.after(150, self.drain)
@@ -225,31 +267,40 @@ class App:
         spin.bind("<FocusOut>", lambda e: self.on_interval())
         ttk.Label(us, text="seconds").grid(row=0, column=2, sticky="w")
         ttk.Button(us, text="Send now", command=self.send_usage_now).grid(row=0, column=3, padx=(16, 0))
+        ttk.Label(us, text="Monthly limit $").grid(row=0, column=4, padx=(16, 4))
+        self.month_limit = tk.IntVar(value=int(s["month_limit"]))
+        lim_spin = ttk.Spinbox(us, from_=0, to=100000, increment=50, width=6, textvariable=self.month_limit,
+                               command=self.on_month_limit)
+        lim_spin.grid(row=0, column=5)
+        lim_spin.bind("<FocusOut>", lambda e: self.on_month_limit())
 
         table = tk.Frame(us)
-        table.grid(row=1, column=0, columnspan=4, sticky="we", pady=(10, 0))
-        for c, head in enumerate(("", "Today", "7 days")):
+        table.grid(row=1, column=0, columnspan=6, sticky="we", pady=(10, 0))
+        for c, head in enumerate(("", "Today", "7 days", "This month")):
             tk.Label(table, text=head, fg="#666666", font=("Helvetica", 10)).grid(row=0, column=c, sticky="w", padx=4)
         self.cells = {}
         for r, (name, color) in enumerate((("claude", BLUE), ("codex", GREEN)), start=1):
             tk.Label(table, text=name.title(), fg="white", bg=color, width=8,
                      font=("Helvetica", 11, "bold")).grid(row=r * 2 - 1, column=0, sticky="we", padx=4, pady=(4, 0))
-            for c, key in ((1, "today"), (2, "week")):
+            for c, key in ((1, "today"), (2, "week"), (3, "month")):
                 lab = tk.Label(table, text="-", font=("Helvetica", 12, "bold"), anchor="w")
-                lab.grid(row=r * 2 - 1, column=c, sticky="we", padx=4, pady=(4, 0))
+                lab.grid(row=r * 3 - 2, column=c, sticky="we", padx=4, pady=(6, 0))
                 self.cells[(name, key)] = lab
+            mbar = Bar(table)
+            mbar.grid(row=r * 3 - 1, column=1, columnspan=3, sticky="we", padx=4, pady=(2, 0))
+            self.cells[(name, "bar")] = mbar
             lim = tk.Label(table, text="", fg="#666666", font=("Helvetica", 10), anchor="w")
-            lim.grid(row=r * 2, column=1, columnspan=2, sticky="we", padx=4)
+            lim.grid(row=r * 3, column=1, columnspan=3, sticky="we", padx=4)
             self.cells[(name, "limit")] = lim
-        table.columnconfigure(1, weight=1)
-        table.columnconfigure(2, weight=1)
+        for c in (1, 2, 3):
+            table.columnconfigure(c, weight=1)
         bar = tk.Frame(us)
-        bar.grid(row=2, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        bar.grid(row=2, column=0, columnspan=6, sticky="we", pady=(8, 0))
         self.usage_line = ttk.Label(bar, text="Reading your logs...")
         self.usage_line.pack(side="left")
         ttk.Button(bar, text="Refresh", command=self.refresh_usage).pack(side="right")
         ttk.Label(us, text="Tokens are input + output; $ is an estimate at API list prices.",
-                  foreground="#666666").grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+                  foreground="#666666").grid(row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
         # Log
         lf = ttk.LabelFrame(body, text="Log", padding=6)
@@ -297,6 +348,16 @@ class App:
         self.ctl.settings["interval"] = v
         self.ctl.save()
 
+    def on_month_limit(self):
+        try:
+            v = max(0, int(self.month_limit.get()))
+        except (tk.TclError, ValueError):
+            v = 400
+        self.month_limit.set(v)
+        self.ctl.settings["month_limit"] = v
+        self.ctl.save()
+        self.refresh_usage()
+
     def on_auto(self):
         self.ctl.settings["auto_usage"] = bool(self.auto.get())
         self.ctl.save()
@@ -326,7 +387,12 @@ class App:
                 continue
             self.cells[(name, "today")].configure(text=f"{short_tokens(t['today'])}   ${t.get('today_usd', 0):.2f}")
             self.cells[(name, "week")].configure(text=f"{short_tokens(t['week'])}   ${t.get('week_usd', 0):.2f}")
-            self.cells[(name, "limit")].configure(text=limit_text(t))
+            if "month" in t:
+                self.cells[(name, "month")].configure(text=f"{short_tokens(t['month'])}   ${t.get('month_usd', 0):.2f}")
+                self.cells[(name, "bar")].set(month_fraction(t))
+            self.cells[(name, "limit")].configure(
+                text="  ".join(x for x in (("Month " + month_text(t)) if t.get("month_limit_usd") else "",
+                                           limit_text(t)) if x))
         self.usage_line.configure(text=f"Read at {time.strftime('%H:%M:%S')}")
 
     def send_usage_now(self):
