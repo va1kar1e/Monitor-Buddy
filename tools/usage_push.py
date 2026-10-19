@@ -19,7 +19,13 @@ at API list prices (PRICES below; --prices FILE adds or changes models). The
 dollars include cached input and cache writes, which the token count leaves out,
 and are what the same usage would cost through the API: a Claude Max or
 ChatGPT Business plan is billed differently. A model without a price counts as
-tokens only, and the tool says so on stderr. Codex logs that carry
+tokens only, and the tool says so on stderr.
+
+"This month" is the calendar month so far in local time, in tokens and dollars.
+--month-limit (default 400 US dollars per assistant) lets the Buddy draw it as a
+bar of dollars spent against that budget.
+
+Codex logs that carry
 rate-limit percentages (some plans do not) also fill the Buddy's limit bars;
 Claude Code keeps no limit numbers locally, so its page shows tokens only.
 
@@ -103,26 +109,35 @@ def local_date(ts):
 
 def new_totals():
     # "_unpriced" (model -> tokens) is for the warning only and never sent.
-    return {"today": 0, "week": 0, "today_usd": 0.0, "week_usd": 0.0, "_unpriced": {}}
+    return {"today": 0, "week": 0, "today_usd": 0.0, "week_usd": 0.0,
+            "month": 0, "month_usd": 0.0, "_unpriced": {}}
 
 
 def add(totals, day, tokens, today, usd=0.0, unpriced_model=None):
     if day is None or tokens <= 0:
         return
     age = (today - day).days
-    if 0 <= age < DAYS:
+    # The calendar month so far, in local time (the billing month of a plan that
+    # renews on the 1st; the 7 days are a rolling window and may reach back past it).
+    in_month = day.year == today.year and day.month == today.month and age >= 0
+    in_week = 0 <= age < DAYS
+    if in_week:
         totals["week"] += tokens
         totals["week_usd"] += usd
         if age == 0:
             totals["today"] += tokens
             totals["today_usd"] += usd
-        if unpriced_model is not None:
-            totals["_unpriced"][unpriced_model] = totals["_unpriced"].get(unpriced_model, 0) + tokens
+    if in_month:
+        totals["month"] += tokens
+        totals["month_usd"] += usd
+    if (in_week or in_month) and unpriced_model is not None:
+        totals["_unpriced"][unpriced_model] = totals["_unpriced"].get(unpriced_model, 0) + tokens
 
 
 def recent_files(root, pattern, today):
-    """Files under root touched in the window (older files cannot add to it)."""
-    cutoff = time.time() - (DAYS + 1) * 86400
+    """Files under root touched in the window (older files cannot add to it): the
+    longer of the last 7 days and the month so far."""
+    cutoff = time.time() - (max(DAYS, today.day) + 1) * 86400
     out = []
     if not root.is_dir():
         return out
@@ -230,8 +245,10 @@ def codex_usage(root, today, prices=PRICES):
     return totals
 
 
-def build_body(only, today, claude_root, codex_root, prices=PRICES):
-    """The body to send; unpriced models are reported on stderr, never sent."""
+def build_body(only, today, claude_root, codex_root, prices=PRICES, month_limit=None):
+    """The body to send; unpriced models are reported on stderr, never sent.
+    month_limit (US dollars) is each assistant's monthly budget; the Buddy draws
+    "this month's dollars / limit" as a bar."""
     body = {}
     if only in (None, "claude"):
         body["claude"] = claude_usage(claude_root, today, prices)
@@ -243,6 +260,9 @@ def build_body(only, today, claude_root, codex_root, prices=PRICES):
                   f"Add it with --prices", file=sys.stderr)
         t["today_usd"] = round(t["today_usd"], 4)
         t["week_usd"] = round(t["week_usd"], 4)
+        t["month_usd"] = round(t["month_usd"], 4)
+        if month_limit:
+            t["month_limit_usd"] = month_limit
     return body
 
 
@@ -276,8 +296,9 @@ def push(base, token, body, timeout=8, path="/usage"):
             return e.code, None
 
 
-def push_serial(port, body, timeout=3.0, command="USAGE"):
-    """Send "@MB <command> <body>" and wait for the reply. Returns (ok, error text)."""
+def serial_command(port, command, body=None, timeout=3.0):
+    """Send "@MB <command> [<body>]" and wait for the reply. Returns (reply, "") with
+    the reply as a dict, or (None, why)."""
     try:
         import serial
     except ImportError:
@@ -287,23 +308,39 @@ def push_serial(port, body, timeout=3.0, command="USAGE"):
     ser.port, ser.baudrate, ser.timeout = port, 115200, 0.2
     ser.dtr = False
     ser.rts = False
+    line_out = b"@MB " + command.encode()
+    if body is not None:
+        line_out += b" " + json.dumps(body, separators=(",", ":")).encode()
     try:
         ser.open()
-        ser.write(b"@MB " + command.encode() + b" " + json.dumps(body, separators=(",", ":")).encode() + b"\n")
+        ser.write(line_out + b"\n")
         deadline = time.time() + timeout
         buf = b""
         while time.time() < deadline:
             buf += ser.read(256)
             for line in buf.split(b"\n"):
                 line = line.strip()
-                if line.startswith(b"@MB ") and b'"cmd":"' + command.encode() + b'"' in line:
+                if not line.startswith(b"@MB "):
+                    continue
+                try:
                     reply = json.loads(line[4:])
-                    return bool(reply.get("ok")), reply.get("error", "")
-        return False, "no reply (is this firmware new enough to have " + command + "?)"
+                except ValueError:
+                    continue   # a line still arriving
+                if isinstance(reply, dict) and reply.get("cmd") == command:
+                    return reply, ""
+        return None, "no reply (is this firmware new enough to have " + command + "?)"
     except (serial.SerialException, OSError) as e:
-        return False, str(e)
+        return None, str(e)
     finally:
         ser.close()
+
+
+def push_serial(port, body, timeout=3.0, command="USAGE"):
+    """Send "@MB <command> <body>" and wait for the reply. Returns (ok, error text)."""
+    reply, why = serial_command(port, command, body, timeout)
+    if reply is None:
+        return False, why
+    return bool(reply.get("ok")), reply.get("error", "")
 
 
 def main(argv=None):
@@ -314,6 +351,9 @@ def main(argv=None):
     ap.add_argument("--once", action="store_true", help="push once and exit")
     ap.add_argument("--dry-run", action="store_true", help="print the body and send nothing")
     ap.add_argument("--only", choices=["claude", "codex"], help="push just one assistant")
+    ap.add_argument("--month-limit", type=float, default=400.0, metavar="USD",
+                    help="monthly budget in US dollars for each assistant, drawn as a bar on the "
+                         "Buddy (default 400; 0 sends none)")
     ap.add_argument("--prices", metavar="FILE",
                     help='JSON of extra or changed prices, e.g. {"gpt-6-new": {"in": 1, "out": 4, "cache_read": 0.1}} '
                          '(USD per 1M tokens)')
@@ -340,7 +380,8 @@ def main(argv=None):
 
     token = None
     while True:
-        body = build_body(args.only, dt.date.today(), claude_root, codex_root, prices)
+        body = build_body(args.only, dt.date.today(), claude_root, codex_root, prices,
+                          args.month_limit if args.month_limit > 0 else None)
         if args.dry_run:
             print(json.dumps(body, indent=2))
             return 0

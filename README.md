@@ -5,7 +5,7 @@
 [![Arduino](https://img.shields.io/badge/framework-Arduino-00979d?logo=arduino)](https://www.arduino.cc/)
 [![License](https://img.shields.io/badge/license-MIT-6c757d)](LICENSE)
 
-**A tiny friend for the side of your monitor.** It pulls faces at you, follows your movements with its eyes, and in its spare time tells you the weather, the date, the moon phase, your stock ticker, and your GitHub stats.
+**A tiny friend for the side of your monitor.** It pulls faces at you, follows your movements with its eyes, and in its spare time tells you the weather, the date, your stock ticker, and your GitHub stats.
 
 <!-- SHOT: hero.jpg - Monitor-Buddy clipped to the right edge of a monitor, screen showing the animated face, taken slightly from the side so you can see the printed holder -->
 
@@ -24,9 +24,9 @@ It is also genuinely useful when you swipe past the face:
 - **Animated face** with several expressions, driven by the on-board QMI8658 motion sensor
 - **Clock** and **weekday / date**, kept accurate over NTP
 - **Weather** for your location (temperature, conditions, humidity, wind)
-- **Moon phase** with illumination percentage
 - **Stock ticker** for any US symbol, via a free Finnhub account
 - **GitHub stats** for your username
+- **Wi-Fi network and IP address**: the last page shows the network the Buddy joined and its IP address (the one the desktop app and `tools/usage_push.py` need)
 - **5 colour themes**, from plain white-on-black to a green-up / red-down semantic theme
 - **Toggle any page on or off** so your Buddy only shows what you care about
 - **Left or right side** of your monitor: one setting turns the screen, touch and eye movement around for a right-side mount
@@ -65,7 +65,7 @@ The firmware also builds for the **Waveshare ESP32-S3-Touch-LCD-1.47**, which ha
 
 ### Claude and Codex usage pages (optional)
 
-Two extra pages show how many tokens **Claude Code** and **Codex** used on your computer today and over the last 7 days. They appear by themselves once a computer starts pushing numbers to the Buddy, and are gone again after a restart. Codex also fills a limit bar when its log has rate-limit percentages (some plans do not); Claude Code keeps none locally, so its page shows tokens only.
+Two extra pages show how many tokens **Claude Code** and **Codex** used on your computer today and over the last 7 days, with an estimate in dollars, and a **MONTH** bar: dollars spent this calendar month against a monthly budget (default $400 for each, `--month-limit` on the tool or *Monthly limit* in the desktop app). They appear by themselves once a computer starts pushing numbers to the Buddy, and are gone again after a restart. Codex also fills a limit bar when its log has rate-limit percentages (some plans do not); Claude Code keeps none locally, so its page shows tokens only.
 
 1. Find the Buddy's address in the serial log (`usage: listening on http://<ip>:8080/usage`), or in your router's device list.
 2. On the computer that runs Claude Code and Codex: `python tools/usage_push.py <ip>`. It needs only Python 3 and sends an update every 60 seconds. `--once` sends one, `--dry-run` shows what would be sent.
@@ -80,6 +80,16 @@ The last page is a status board: the word fills the screen on a colour, **FREE**
 
 - **On the Buddy:** tap the page to step Free → Busy → In a meeting. Swipe still changes page.
 - **From your computer:** `python tools/status_push.py --serial COM11 busy` (or `free`, `meeting`) over the USB cable, or `python tools/status_push.py <ip> busy` over Wi-Fi with the same pairing as the usage pages. This works from a hotkey, a Stream Deck button or a script.
+
+### Desktop app (optional)
+
+A small window with one entry for every page the Buddy shows (Face, Clock, Date, Weather, Stock, GitHub, Claude, Codex, Status, Wi-Fi) and its numbers. Pick the USB port (a Buddy is picked for you) or enter its Wi-Fi address, click **Free**, **Busy** or **In a meeting** on the Status page, and tick **Send usage every 60 seconds** to keep the Claude and Codex pages current. The Buddy fetches its own weather, GitHub and stock numbers, so the app asks the same services with the same settings: **Load from Buddy** (USB) copies the location, GitHub user and ticker from it, and the Stock page needs your Finnhub key typed in (kept in `~/.monitor-buddy-app.json`, plain text). The Wi-Fi page shows the network name and IP address the Buddy reports over USB.
+- **Setup** (the last entry, USB only) edits the Buddy's own settings: screen side, colour theme, time zone, location, units, GitHub user, ticker, Finnhub key and which pages show. It reads them from the Buddy, sends only what you changed, and the Buddy checks every value and restarts when it saves. The **Wi-Fi networks** tab keeps a list of networks (**Add**, **Edit**, **Delete**); **Send to Buddy** makes the selected one the Buddy's network. The Buddy itself remembers one network at a time. Passwords are kept as plain text in `~/.monitor-buddy-app.json` (untick *Keep the password* to be asked each time).
+
+- **Windows:** `MonitorBuddy.exe`. **macOS:** `MonitorBuddy.dmg`, drag the app to Applications. Both are built by the *Desktop app* workflow: open the run in the **Actions** tab and download them from **Artifacts**.
+- The apps are not code-signed, so the first start gets a warning. Windows: **More info → Run anyway**. macOS: right-click the app → **Open** → **Open** (or allow it under System Settings → Privacy & Security).
+- From source: `pip install pyserial` and `python tools/buddy_app.py`. To build the app yourself: `pip install pyinstaller pyserial` and `python tools/build_app.py` (it builds for the system it runs on).
+- Settings are kept in `~/.monitor-buddy-app.json`. Only one program can use the USB port at a time, so close the app before using the web flasher.
 
 ---
 

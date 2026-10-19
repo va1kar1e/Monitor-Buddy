@@ -15,14 +15,16 @@ struct UsageSlot {
   int16_t  pct1, pct2;
   int32_t  reset1;
   float    todayUsd, weekUsd;   // US dollars, -1 when the PC sent none
+  float    monthUsd;            // dollars this calendar month, -1 when not sent
+  float    monthLimitUsd;       // the monthly budget, -1 when not sent
   uint32_t updatedAt;   // millis() of the push; set by the caller
 };
 
 // Body: {"claude": {...}, "codex": {...}}, each object optional:
 //   {"today": 123456, "week": 9876543, "pct1": 42, "pct2": 17, "reset1": 134,
-//    "today_usd": 4.21, "week_usd": 18.9}
+//    "today_usd": 4.21, "week_usd": 18.9, "month_usd": 126.4, "month_limit_usd": 400}
 // "today" and "week" are required numbers >= 0; the rest are optional (pct 0-100,
-// reset1 >= 0, *_usd 0-1e7). A present provider that is invalid fails the whole body and
+// reset1 >= 0, *_usd 0-1e7, month_limit_usd 1-1e7). A present provider that is invalid fails the whole body and
 // leaves every output untouched. Unknown keys are ignored. At least one provider
 // must be present.
 bool usageParse(JsonVariantConst body, UsageSlot &claude, bool &hasClaude,
