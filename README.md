@@ -1,9 +1,19 @@
 # Monitor-Buddy
 
 [![Version](https://img.shields.io/badge/version-1.2.0-4361ee)](https://github.com/IdefixRC/Monitor-Buddy/releases)
-[![Platform](https://img.shields.io/badge/platform-ESP32--C6-2ec27e?logo=espressif)](https://www.espressif.com/en/products/socs/esp32-c6)
+[![Platform](https://img.shields.io/badge/platform-ESP32--C6%20%7C%20ESP32--S3-2ec27e?logo=espressif)](https://www.espressif.com/en/products/socs/esp32-s3)
 [![Arduino](https://img.shields.io/badge/framework-Arduino-00979d?logo=arduino)](https://www.arduino.cc/)
 [![License](https://img.shields.io/badge/license-MIT-6c757d)](LICENSE)
+
+> **About this fork.** This is a modified copy of [IdefixRC/Monitor-Buddy](https://github.com/IdefixRC/Monitor-Buddy), adapted to run on the **Waveshare ESP32-S3-Touch-LCD-1.47** as well as the original ESP32-C6 board. The changes were made with the help of **Claude** (Anthropic's AI assistant, through Claude Code) and checked on a real ESP32-S3 board. All credit for the Buddy itself goes to the original author.
+>
+> What is different from the original:
+> - **ESP32-S3 support**: a pin map per board in [`lib/board/board_pins.h`](lib/board/board_pins.h) and an `esp32-s3` build environment ([details](#using-the-esp32-s3-board-instead-experimental)). The ESP32-C6 build is unchanged.
+> - **Removed**: the moon page.
+> - **New pages**: Claude and Codex usage (tokens, estimated dollars, monthly budget bar), Free / Busy / In a meeting, and the Wi-Fi network with the IP address ([usage pages](#claude-and-codex-usage-pages-optional), [status page](#free--busy--in-a-meeting-page-optional)).
+> - **A desktop app** (Windows `.exe`, macOS `.dmg`) that shows every page, sets the status, pushes usage and edits the Buddy's settings and Wi-Fi over USB ([desktop app](#desktop-app-optional)).
+>
+> The web flasher still recognises the ESP32-C6 board only, and these additions are not part of the original project. Report problems with this fork in this repository, not to the original author.
 
 **A tiny friend for the side of your monitor.** It pulls faces at you, follows your movements with its eyes, and in its spare time tells you the weather, the date, your stock ticker, and your GitHub stats.
 
@@ -55,7 +65,7 @@ Nothing else. No resistors, no headers, no hot glue.
 
 ### Using the ESP32-S3 board instead (experimental)
 
-The firmware also builds for the **Waveshare ESP32-S3-Touch-LCD-1.47**, which has the same 1.47" touchscreen as the C6 board. This is new and has not been tried on a real board yet, so treat it as a preview and please report what you find.
+The firmware also builds for the **Waveshare ESP32-S3-Touch-LCD-1.47**, which has the same 1.47" touchscreen as the C6 board. It has been tried on one real board (display, touch, Wi-Fi, the new pages), but the pins come from the board's schematic, so treat it as a preview and please report what you find.
 
 - **Build it from source**, as in [4. Flashing the board](#4-flashing-the-board), but choose the `esp32-s3` environment: `pio run -e esp32-s3`, and `pio run -e esp32-s3 --target upload` to flash. In VS Code, pick `esp32-s3` in the PlatformIO environment switcher at the bottom of the window. The pin map for both boards is in [`lib/board/board_pins.h`](lib/board/board_pins.h).
 - **The web flasher does not support it yet.** It only recognises the ESP32-C6 board, and will say no compatible board was found.
