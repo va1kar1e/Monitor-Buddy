@@ -727,7 +727,7 @@ void snapshotNetData() {
 
 // Themed colours, assigned once by applyTheme() from settings.theme.
 uint16_t COL_TIME, COL_SEC, COL_DATE_WD, COL_DATE_BIG, COL_VALUE, COL_LABEL;
-uint16_t COL_TEMP, COL_WICON, COL_WSUB;
+uint16_t COL_TEMP, COL_WICON, COL_WSUB, COL_MOON, COL_MOONLAB;   // COL_MOON*: the moon page is gone; kept so the web preview's themes stay in sync
 uint16_t COL_PRICE_UP, COL_PRICE_DOWN, COL_TICKER, COL_GHLOGO, COL_GHNUM;
 
 // ── Helpers ────────────────────────────────────────────────
@@ -742,21 +742,21 @@ uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
 void applyTheme() {
   uint16_t W = FG;
   COL_TIME=COL_SEC=COL_DATE_WD=COL_DATE_BIG=COL_VALUE=COL_LABEL=W;
-  COL_TEMP=COL_WICON=COL_WSUB=W;
+  COL_TEMP=COL_WICON=COL_WSUB=W;  COL_MOON=W;  COL_MOONLAB=W;
   COL_PRICE_UP=COL_PRICE_DOWN=COL_TICKER=COL_GHLOGO=COL_GHNUM=W;
   switch (settings.theme) {
     case 1: {
       uint16_t CY=rgb(0,200,255), GRAY=rgb(120,130,140);
-      COL_SEC=CY; COL_DATE_WD=CY; COL_TEMP=CY;
+      COL_SEC=CY; COL_DATE_WD=CY; COL_TEMP=CY; COL_MOONLAB=CY;
       COL_PRICE_UP=COL_PRICE_DOWN=CY; COL_GHNUM=CY;
-      COL_LABEL=GRAY; COL_WSUB=GRAY;
+      COL_LABEL=GRAY; COL_WSUB=GRAY; COL_MOON=rgb(220,220,220);
       break;
     }
     case 2: {
       uint16_t GRAY=rgb(120,130,140);
       COL_SEC=rgb(255,180,40); COL_DATE_WD=rgb(255,180,40);
       COL_TEMP=rgb(255,140,60); COL_WICON=rgb(255,210,90); COL_WSUB=rgb(60,200,200);
-
+      COL_MOON=rgb(255,210,90); COL_MOONLAB=rgb(0,200,255);
       COL_PRICE_UP=rgb(60,220,120); COL_PRICE_DOWN=rgb(255,80,90);
       COL_GHNUM=rgb(60,220,120); COL_LABEL=GRAY;
       break;
@@ -766,7 +766,7 @@ void applyTheme() {
       COL_TIME=AM; COL_SEC=GO; COL_DATE_WD=AM; COL_DATE_BIG=CR;
       COL_VALUE=rgb(235,215,180); COL_LABEL=rgb(150,120,80);
       COL_TEMP=AM; COL_WICON=GO; COL_WSUB=rgb(180,150,110);
-
+      COL_MOON=GO; COL_MOONLAB=AM;
       COL_PRICE_UP=COL_PRICE_DOWN=AM; COL_TICKER=CR; COL_GHLOGO=CR; COL_GHNUM=AM;
       break;
     }
@@ -776,7 +776,7 @@ void applyTheme() {
       COL_TIME=CY; COL_SEC=TE; COL_DATE_WD=BL; COL_DATE_BIG=LG;
       COL_VALUE=LG; COL_LABEL=SL;
       COL_TEMP=CY; COL_WICON=BL; COL_WSUB=TE;
-
+      COL_MOON=rgb(210,225,245); COL_MOONLAB=CY;
       COL_PRICE_UP=COL_PRICE_DOWN=CY; COL_TICKER=LG; COL_GHLOGO=LG; COL_GHNUM=CY;
       break;
     }
