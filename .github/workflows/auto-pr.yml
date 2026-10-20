@@ -1,0 +1,44 @@
+name: Open pull request
+
+# Opens a pull request into the default branch when a branch is pushed, unless
+# one is already open or the branch has nothing new. It needs the repository
+# setting Settings > Actions > General > Workflow permissions > "Allow GitHub
+# Actions to create and approve pull requests".
+#
+# A pull request opened with the workflow's own token does not start the
+# workflows that listen for pull_request; those that also listen for push (the
+# "Desktop app" workflow) still run from the push itself.
+on:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          open=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          if [ "$open" != "0" ]; then
+            echo "A pull request for $BRANCH is already open."
+            exit 0
+          fi
+          ahead=$(git rev-list --count "origin/$BASE..origin/$BRANCH")
+          if [ "$ahead" = "0" ]; then
+            echo "$BRANCH has nothing that $BASE does not."
+            exit 0
+          fi
+          gh pr create --base "$BASE" --head "$BRANCH" --fill \
+            --body "Opened automatically when \`$BRANCH\` was pushed ($ahead commit(s) ahead of \`$BASE\`)."
