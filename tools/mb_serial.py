@@ -65,10 +65,12 @@ def open_port(port):
     s.port = port
     s.baudrate = BAUD
     s.timeout = 0.1
-    # Opening with DTR/RTS asserted resets the ESP32-C6 over USB (rst=11).
-    s.dtr = False
-    s.rts = False
+    # Opening with DTR/RTS asserted resets the ESP32-C6 over USB (rst=11); see
+    # usage_push.quiet_open_prepare for the order that avoids it on every system.
+    import usage_push
+    usage_push.quiet_open_prepare(s)
     s.open()
+    usage_push.quiet_open_finish(s)
     return s
 
 

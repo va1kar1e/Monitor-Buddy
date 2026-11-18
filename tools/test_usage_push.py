@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import usage_push as up
@@ -197,6 +198,33 @@ class Token(unittest.TestCase):
             self.assertGreaterEqual(len(first), 16)   # the firmware requires 16-64
             self.assertLessEqual(len(first), 64)
             self.assertEqual(up.load_token(path), first)
+
+
+class NativeCdc(unittest.TestCase):
+    class P:
+        def __init__(self, device, vid, pid):
+            self.device, self.vid, self.pid = device, vid, pid
+
+    def test_tells_tinyusb_from_usb_serial_jtag(self):
+        import serial.tools.list_ports as lp
+        ports = [self.P("/dev/cu.jtag", 0x303A, 0x1001), self.P("/dev/cu.cdc", 0x303A, 0x4001),
+                 self.P("COM3", 0x0403, 0x6001)]
+        with mock.patch.object(lp, "comports", return_value=ports):
+            self.assertFalse(up.native_cdc("/dev/cu.jtag"))
+            self.assertTrue(up.native_cdc("/dev/cu.cdc"))
+            self.assertFalse(up.native_cdc("COM3"))
+            self.assertFalse(up.native_cdc("/dev/cu.gone"))
+
+    def test_dtr_is_high_for_tinyusb_and_low_for_jtag(self):
+        class Ser:
+            port = "x"
+            dtr = rts = None
+        with mock.patch.object(up, "native_cdc", return_value=True):
+            s = Ser(); up.quiet_open_prepare(s); up.quiet_open_finish(s)
+            self.assertEqual((s.dtr, s.rts), (True, False))
+        with mock.patch.object(up, "native_cdc", return_value=False):
+            s = Ser(); up.quiet_open_finish(s)
+            self.assertEqual((s.dtr, s.rts), (False, False))
 
 
 if __name__ == "__main__":

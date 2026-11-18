@@ -91,5 +91,33 @@ class Pages(unittest.TestCase):
                          ["face", "clock", "date", "weather", "stock", "github", "claude", "codex", "status", "wifi"])
 
 
+class Feed(unittest.TestCase):
+    """The bodies sent to a Buddy that has no Wi-Fi (the firmware's lib/feed checks them again)."""
+
+    def test_weather_body_has_the_code_the_buddy_draws_from(self):
+        cur = {"current": {"temperature_2m": 31.4, "relative_humidity_2m": 70, "weather_code": 61,
+                           "wind_speed_10m": 9.2, "is_day": 0}}
+        d = bp.weather_page("1", "2", fetch=lambda url: cur)
+        self.assertEqual(bp.feed_body("weather", d),
+                         {"temp": 31, "humidity": 70, "wind": 9, "code": 61, "is_day": False})
+
+    def test_stock_body_adds_the_symbol(self):
+        d = {"price": 327.74, "open": 323.1, "high": 329.6, "low": 322.2, "change_pct": 0.35}
+        self.assertEqual(bp.feed_body("stock", d, " aapl "),
+                         {"price": 327.74, "open": 323.1, "high": 329.6, "low": 322.2, "symbol": "AAPL"})
+        self.assertNotIn("symbol", bp.feed_body("stock", d, ""))
+
+    def test_github_body(self):
+        self.assertEqual(bp.feed_body("github", {"followers": 12, "repos": 3}), {"followers": 12, "repos": 3})
+
+    def test_unknown_page(self):
+        with self.assertRaises(ValueError):
+            bp.feed_body("moon", {})
+
+    def test_time_body_is_utc_seconds(self):
+        self.assertEqual(bp.time_body(1790000000.9), {"epoch": 1790000000})
+        self.assertGreater(bp.time_body()["epoch"], 1700000000)
+
+
 if __name__ == "__main__":
     unittest.main()

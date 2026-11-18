@@ -30,14 +30,15 @@ from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 
 import buddy_pages as bp
+import jiggler
 import usage_push as up
 
 SETTINGS_PATH = Path("~/.monitor-buddy-app.json").expanduser()
-DEFAULTS = {"mode": "usb", "port": "", "host": "", "interval": 60, "auto_usage": False,
+DEFAULTS = {"mode": "usb", "port": "", "host": "", "interval": 60, "auto_usage": True,
             "month_limit": 400,
             "lat": "13.7563", "lon": "100.5018", "fahrenheit": False, "mph": False,
             "github_user": "", "ticker": "AAPL", "finnhub_key": "",
-            "wifi_profiles": []}
+            "wifi_profiles": [], "feed": True, "jiggle_where": "computer", "jiggle_mode": "random", "jiggle_interval": 30, "jiggle_distance": 5}
 
 # The Buddy's own settings (what @MB SET config takes), for the Setup page.
 THEMES = ["0  classic white", "1", "2", "3", "4"]
@@ -50,7 +51,7 @@ TZ_PRESETS = [("Bangkok (UTC+7)", "Asia/Bangkok", "<+07>-7"), ("Singapore (UTC+8
 SETUP_PAGES = [("face", "Face"), ("clock", "Clock"), ("date", "Date"), ("weather", "Weather"),
                ("stock", "Stock"), ("github", "GitHub")]   # the moon page no longer exists
 
-# CP AXTRA palette.
+# Colour palette.
 BLUE, YELLOW, GREEN, RED = "#306FC7", "#F6C24A", "#43938F", "#DA3832"
 GRAY = "#666666"
 STATES = [("free", "Free", GREEN, "white"), ("busy", "Busy", RED, "white"),
@@ -134,6 +135,16 @@ class Bar(tk.Canvas):
                                   fill=bar_color(self.fraction))
 
 
+def agent_text_problem(text):
+    """Why this cannot be the screen saver's last line (the Buddy's font is plain ASCII and the
+    line must fit the screen), or None. An empty text is fine: it means the default."""
+    if len(text) > 24:
+        return "The text can be at most 24 characters."
+    if text and (not all(32 <= ord(c) <= 126 for c in text) or not text.strip()):
+        return "Use letters, digits and punctuation only (the Buddy's font has no accents or emoji)."
+    return None
+
+
 def wifi_problem(ssid, password):
     """Why this network cannot be saved on the Buddy (the same rules it applies), or None."""
     if not 1 <= len(ssid) <= 32:
@@ -143,6 +154,26 @@ def wifi_problem(ssid, password):
     return None
 
 
+MAC_NOISE_PORTS = ("Bluetooth-Incoming-Port", "debug-console", "wlan-debug")
+
+
+def usable_ports(ports):
+    """Drops what is never a Buddy on macOS: the built-in Bluetooth/debug pseudo ports,
+    and the /dev/tty.* twin of every /dev/cu.* port (cu.* is the one to open: tty.* can
+    block waiting for a carrier). Other systems' ports pass through untouched."""
+    devices = {p.device for p in ports}
+    out = []
+    for p in ports:
+        name = p.device.rsplit("/", 1)[-1]
+        if p.device.startswith("/dev/"):
+            if any(n in name for n in MAC_NOISE_PORTS):
+                continue
+            if name.startswith("tty.") and "/dev/cu." + name[4:] in devices:
+                continue
+        out.append(p)
+    return out
+
+
 def list_ports():
     """[(device, label, looks_like_a_buddy)]; empty when pyserial is missing."""
     try:
@@ -150,7 +181,7 @@ def list_ports():
     except ImportError:
         return []
     out = []
-    for p in sorted(list_ports.comports(), key=lambda p: p.device):
+    for p in sorted(usable_ports(list_ports.comports()), key=lambda p: p.device):
         buddy = p.vid == ESPRESSIF_VID
         out.append((p.device, f"{p.device}  {p.description}" + ("  (Buddy?)" if buddy else ""), buddy))
     return out
@@ -340,6 +371,96 @@ class Controller:
             return False, problem
         return self._usb_set({"wifi": {"ssid": ssid, "password": password}})
 
+    # ── feeding the Buddy over USB (so its pages work with no Wi-Fi) ──
+    def feed_enabled(self):
+        s = self.settings
+        return bool(s.get("feed")) and s["mode"] == "usb" and bool(s["port"])
+
+    def _feed(self, command, body):
+        """(ok, message) for one push over USB."""
+        with self.lock:
+            ok, err = up.push_serial(self.settings["port"], body, command=command)
+        if not ok and "unknown command" in err:
+            err = "this Buddy's firmware is too old for this: update it with the web flasher"
+        return ok, "" if ok else err
+
+    def feed_page(self, key, data):
+        """Sends one page's numbers to the Buddy. (True, '') when sent, (None, '') when feeding
+        is off or not possible (nothing to report), (False, why) when the Buddy refused."""
+        if not self.feed_enabled():
+            return None, ""
+        return self._feed(bp.FEED_COMMANDS[key], bp.feed_body(key, data, self.settings.get("ticker")))
+
+    def feed_time(self):
+        if not self.feed_enabled():
+            return None, ""
+        return self._feed("TIME", bp.time_body())
+
+    def agent_buddy(self, show=None, text=None, pin=None):
+        """(state, why): the Buddy's "AI agent is running" page after setting `show` (on/off) and/or
+        `pin` (stay on it, no auto-scroll) and/or `text` (its last line; "" is the default again);
+        all None only reads. state is {'show': bool, 'pin': bool, 'text': str}; None with the reason
+        in why when it fails. USB only."""
+        s = self.settings
+        if s["mode"] != "usb" or not s["port"]:
+            return None, "The Buddy's screen saver is set over the USB cable: pick the port above."
+        body = {}
+        if show is not None:
+            body["show"] = bool(show)
+        if pin is not None:
+            body["pin"] = bool(pin)
+        if text is not None:
+            problem = agent_text_problem(text)
+            if problem:
+                return None, problem
+            body["text"] = text
+        with self.lock:
+            reply, why = up.serial_command(s["port"], "AGENT", body or None)
+        if reply is None:
+            return None, why
+        if not reply.get("ok"):
+            err = reply.get("error", "the Buddy refused")
+            if err == "unknown command":
+                err = "this Buddy's firmware is too old for this: flash the new one"
+            return None, err
+        return {"show": bool(reply.get("show")), "pin": bool(reply.get("pin")),
+                "text": reply.get("text", "")}, ""
+
+    def rotate_buddy(self):
+        """(mount, why): turns the Buddy's screen 180° at once (USB) and returns the side it is
+        set to now, "left" or "right"; the Buddy saves it, no restart."""
+        s = self.settings
+        if s["mode"] != "usb" or not s["port"]:
+            return None, "Turning the screen needs the USB cable: pick the port above."
+        with self.lock:
+            reply, why = up.serial_command(s["port"], "ROTATE")
+        if reply is None:
+            return None, why
+        if not reply.get("ok"):
+            err = reply.get("error", "the Buddy refused")
+            if err == "unknown command":
+                err = "this Buddy's firmware is too old for this: flash the new one"
+            return None, err
+        return reply.get("mount"), ""
+
+    # ── the Buddy's own mouse jiggler (firmware env esp32-s3-hid) ──
+    def buddy_jiggle(self, body=None):
+        """(state, why): the Buddy's jiggler settings after sending `body` (None only reads).
+        state is {'enabled','mode','interval','distance'}; state None gives the reason."""
+        s = self.settings
+        if s["mode"] != "usb" or not s["port"]:
+            return None, "The Buddy's own jiggler is set over the USB cable: pick the port above."
+        with self.lock:
+            reply, why = up.serial_command(s["port"], "JIGGLE", body)
+        if reply is None:
+            return None, why
+        if not reply.get("ok"):
+            err = reply.get("error", "the Buddy refused")
+            if err == "unknown command":
+                err = "this Buddy's firmware is too old: flash the esp32-s3-hid firmware"
+            return None, err
+        return {k: reply.get(k) for k in ("enabled", "mode", "interval", "distance")}, ""
+
     def fetch_page(self, key):
         """The data for one network page; raises buddy_pages.FetchError."""
         s = self.settings
@@ -365,7 +486,10 @@ class App:
         self.cells = {}
         self.vars = {}               # setting name -> tk variable of its entry
         self.page_frames = {}
-        self.pages = bp.PAGES + [("setup", "Setup")]   # the Buddy's pages, then this app's setup
+        self.pages = bp.PAGES + [("jiggler", "Mouse Jiggler"), ("setup", "Setup")]   # the Buddy's pages, then this app's own
+        self.jbuddy_said = False
+        self.agent_said = None
+        self.fed_said = set()        # pages already reported as sent to the Buddy
         self.cfg_vars = {}           # Buddy setting key -> tk variable on the Setup page
         self.cfg_dirty = set()       # keys the user changed since the last read or save
         self._filling = False        # True while the page is being filled in, not edited
@@ -373,7 +497,7 @@ class App:
         self.page_labels = {}        # (page, field) -> label
         self.port_map = {}           # combobox label -> device
         root.title("Monitor Buddy")
-        root.minsize(780, 700)
+        root.minsize(780, 740)
         self.build()
         self.refresh_ports()
         self.root.after(150, self.drain)
@@ -397,7 +521,7 @@ class App:
 
         mid = ttk.Frame(self.root, padding=(16, 12, 16, 0))
         mid.pack(fill="both", expand=True)
-        self.listbox = tk.Listbox(mid, width=14, exportselection=False, activestyle="none",
+        self.listbox = tk.Listbox(mid, width=16, exportselection=False, activestyle="none",
                                   font=("Helvetica", 12), height=10)
         for _, label in self.pages:
             self.listbox.insert("end", label)
@@ -443,6 +567,10 @@ class App:
         self.host_entry.grid(row=1, column=1, padx=8, pady=(6, 0), sticky="we")
         self.host.trace_add("write", lambda *a: self.on_host())
         ttk.Label(conn, text="IP address, e.g. 192.168.1.50").grid(row=1, column=2, columnspan=2, pady=(6, 0))
+        self.feed = tk.BooleanVar(value=bool(s.get("feed", True)))
+        ttk.Checkbutton(conn, text="Feed the Buddy the time, weather, stock and GitHub over USB "
+                                   "(its pages then work with no Wi-Fi)", variable=self.feed,
+                        command=self.on_feed).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
         conn.columnconfigure(1, weight=1)
 
     def build_usage_sending(self, frame):
@@ -582,6 +710,27 @@ class App:
             row.columnconfigure(i, weight=1, uniform="st")
             self.buttons[key] = b
         self.small(f, "status", "note", "Click a button, or tap the Buddy's screen.")
+        # The "AI agent is running" screen saver: a page in the Buddy's AI section, switched on
+        # or off here (USB), kept on the Buddy.
+        box = ttk.LabelFrame(f, text="AI agent screen saver", padding=8)
+        box.pack(anchor="w", fill="x", pady=(18, 0))
+        self.agent_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Show \u201cAI agent is running, don\u2019t touch this Mac\u201d on the Buddy",
+                        variable=self.agent_on, command=self.on_agent).pack(anchor="w")
+        self.agent_pin = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Pin it: stay on this page, no auto-scroll away from it",
+                        variable=self.agent_pin, command=self.on_agent_pin).pack(anchor="w", pady=(4, 0))
+        row = ttk.Frame(box)
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Label(row, text="Last line").pack(side="left")
+        self.agent_text = tk.StringVar(value="DON'T TOUCH THIS MAC")
+        entry = ttk.Entry(row, textvariable=self.agent_text, width=28)
+        entry.pack(side="left", padx=6)
+        entry.bind("<Return>", lambda e: self.on_agent_text())
+        ttk.Button(row, text="Set text", command=self.on_agent_text).pack(side="left")
+        self.small(box, "status", "agent_note", "A page in the Buddy's AI section, for when an agent is working "
+                   "on this computer. The last line is up to 24 characters; empty goes back to the default. "
+                   "Untick the box when no agent is running. Needs the USB cable.", wrap=460)
 
     def page_wifi(self, f):
         self.title(f, "Wi-Fi")
@@ -590,6 +739,66 @@ class App:
         self.small(f, "wifi", "more", "")
         self.small(f, "wifi", "error", "", RED)
         self.refresh_button(f, ["wifi"])
+
+    def page_jiggler(self, f):
+        """Mouse jiggler: always off at start (it is never saved as on); style, interval and size are kept."""
+        s = self.ctl.settings
+        self.title(f, "Mouse Jiggler")
+        self.small(f, "jiggler", "about", "Nudges the pointer now and then so the computer does not go idle. "
+                   "The pointer always comes back to where it was, and a nudge is skipped while you are "
+                   "moving the mouse yourself.", wrap=480)
+        self.jiggle_where = tk.StringVar(value=s.get("jiggle_where", "computer")
+                                         if s.get("jiggle_where") in ("computer", "buddy") else "computer")
+        where = ttk.LabelFrame(f, text="Runs on", padding=8)
+        where.pack(anchor="w", fill="x", pady=(12, 0))
+        for value, label, hint in (("computer", "This computer", "this app moves the pointer; keep it open"),
+                                   ("buddy", "The Buddy (ESP32-S3)", "the Buddy is a USB mouse and does it itself, "
+                                    "even with this app closed; needs the esp32-s3-hid firmware")):
+            r = ttk.Frame(where)
+            r.pack(anchor="w", pady=1)
+            ttk.Radiobutton(r, text=label, variable=self.jiggle_where, value=value,
+                            command=self.on_jiggle_where).pack(side="left")
+            ttk.Label(r, text=hint, foreground=GRAY, wraplength=330, justify="left").pack(side="left", padx=8)
+        self.jiggle_on = tk.BooleanVar(value=False)
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(14, 0))
+        ttk.Checkbutton(row, text="Mouse jiggler on", variable=self.jiggle_on, command=self.on_jiggle).pack(side="left")
+        self.jiggle_state = tk.Label(row, text="OFF", fg="white", bg=GRAY, font=("Helvetica", 11, "bold"),
+                                     padx=8, pady=1)
+        self.jiggle_state.pack(side="left", padx=10)
+
+        self.jiggle_mode = tk.StringVar(value=s["jiggle_mode"] if s["jiggle_mode"] in jiggler.MODES else "random")
+        box = ttk.LabelFrame(f, text="Style", padding=8)
+        box.pack(anchor="w", fill="x", pady=(14, 0))
+        for value, label, hint in (("random", "Random", "random direction and distance, at random times"),
+                                   ("steady", "Steady", "the same small move at fixed intervals")):
+            r = ttk.Frame(box)
+            r.pack(anchor="w", pady=1)
+            ttk.Radiobutton(r, text=label, variable=self.jiggle_mode, value=value,
+                            command=self.on_jiggle_options).pack(side="left")
+            ttk.Label(r, text=hint, foreground=GRAY).pack(side="left", padx=8)
+
+        opts = ttk.LabelFrame(f, text="Timing and size", padding=8)
+        opts.pack(anchor="w", fill="x", pady=(10, 0))
+        self.jiggle_interval = tk.IntVar(value=int(s["jiggle_interval"]))
+        self.jiggle_distance = tk.IntVar(value=int(s["jiggle_distance"]))
+        for label, var, rng, step, unit in (("Every", self.jiggle_interval, jiggler.INTERVAL_RANGE, 5, "seconds"),
+                                            ("Up to", self.jiggle_distance, jiggler.DISTANCE_RANGE, 1, "pixels")):
+            r = ttk.Frame(opts)
+            r.pack(anchor="w", pady=2)
+            ttk.Label(r, text=label, width=6).pack(side="left")
+            spin = ttk.Spinbox(r, from_=rng[0], to=rng[1], increment=step, width=6, textvariable=var,
+                               command=self.on_jiggle_options)
+            spin.pack(side="left")
+            spin.bind("<FocusOut>", lambda e: self.on_jiggle_options())
+            ttk.Label(r, text=unit).pack(side="left", padx=6)
+        self.small(opts, "jiggler", "note", "In Random the time between nudges varies from half to one and a half "
+                   "times the interval.", wrap=460)
+        self.jiggler = None
+
+    def set_jiggle_state(self, on):
+        where = " (on the Buddy)" if self.jiggle_where.get() == "buddy" else ""
+        self.jiggle_state.configure(text=("ON" if on else "OFF") + where, bg=GREEN if on else GRAY)
 
     def page_setup(self, f):
         self.title(f, "Setup")
@@ -648,8 +857,32 @@ class App:
         btns.grid(row=r + 10, column=0, columnspan=3, sticky="w", pady=(14, 0))
         ttk.Button(btns, text="Read from Buddy", command=self.read_setup).pack(side="left")
         ttk.Button(btns, text="Save to Buddy", command=self.save_setup).pack(side="left", padx=8)
+        ttk.Button(btns, text="Rotate 180\u00b0", command=self.rotate_now).pack(side="left")
         self.setup_note = ttk.Label(p, text="Saving restarts the Buddy. Needs the USB cable.", foreground=GRAY)
         self.setup_note.grid(row=r + 11, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+    def on_agent(self):
+        self.send_agent(bool(self.agent_on.get()))
+
+    def on_agent_pin(self):
+        self.send_agent(None, None, bool(self.agent_pin.get()))
+
+    def on_agent_text(self):
+        self.send_agent(None, self.agent_text.get())
+
+    def send_agent(self, show, text=None, pin=None):
+        """All None only reads the Buddy's settings. The answer comes back as an "agent" event."""
+        def work():
+            state, why = self.ctl.agent_buddy(show, text, pin)
+            self.events.put(("agent", state, why))
+        threading.Thread(target=work, daemon=True).start()
+
+    def rotate_now(self):
+        """Turns the Buddy's screen and touch 180° right away (no restart, saved on the Buddy)."""
+        def work():
+            mount, why = self.ctl.rotate_buddy()
+            self.events.put(("rotated", mount, why))
+        threading.Thread(target=work, daemon=True).start()
 
     def pick_tz(self, index):
         if index >= 0:
@@ -815,6 +1048,10 @@ class App:
             self.page_frames[key].tkraise()
             if key == "wifi":
                 self.refresh_network_pages(["wifi"])
+            if key == "jiggler" and self.jiggle_where.get() == "buddy":
+                self.send_buddy_jiggle(None)
+            if key == "status" and self.ctl.settings["mode"] == "usb" and self.ctl.settings["port"]:
+                self.send_agent(None)             # shows what the Buddy has
             if key == "setup" and not self.setup_read and self.ctl.settings["mode"] == "usb":
                 self.read_setup()
 
@@ -838,6 +1075,13 @@ class App:
     def on_port(self):
         self.ctl.settings["port"] = self.port_map.get(self.port.get(), "")
         self.ctl.save()
+        self.feed_now()
+
+    def on_feed(self):
+        self.ctl.settings["feed"] = bool(self.feed.get())
+        self.ctl.save()
+        if self.feed.get():
+            self.feed_now()
 
     def on_host(self):
         self.ctl.settings["host"] = self.host.get()
@@ -874,6 +1118,78 @@ class App:
         self.ctl.save()
         self.usage_tick()   # sends now when ticked; cancels the pending one when not
 
+    def jiggle_values(self):
+        """(mode, interval, distance) from the controls, clamped and written back."""
+        mode = self.jiggle_mode.get()
+        vals = []
+        for var, rng, default in ((self.jiggle_interval, jiggler.INTERVAL_RANGE, 30),
+                                  (self.jiggle_distance, jiggler.DISTANCE_RANGE, 5)):
+            try:
+                v = jiggler.clamp(int(var.get()), rng)
+            except (tk.TclError, ValueError):
+                v = default
+            var.set(v)
+            vals.append(v)
+        s = self.ctl.settings
+        s["jiggle_mode"], s["jiggle_interval"], s["jiggle_distance"] = mode, vals[0], vals[1]
+        self.ctl.save()
+        return mode, vals[0], vals[1]
+
+    def on_jiggle_options(self):
+        mode, interval, distance = self.jiggle_values()
+        if self.jiggle_where.get() == "buddy":
+            self.send_buddy_jiggle({"mode": mode, "interval": interval, "distance": distance})
+        elif self.jiggler and self.jiggler.running:  # a change applies at once: restart quietly
+            self.stop_jiggler()
+            self.start_jiggler()
+
+    def on_jiggle(self):
+        mode, interval, distance = self.jiggle_values()
+        if self.jiggle_where.get() == "buddy":
+            self.send_buddy_jiggle({"enabled": bool(self.jiggle_on.get()), "mode": mode,
+                                    "interval": interval, "distance": distance})
+        elif self.jiggle_on.get():
+            self.start_jiggler()
+        else:
+            self.stop_jiggler()
+
+    def on_jiggle_where(self):
+        """Switching between this computer and the Buddy: never both at once."""
+        self.ctl.settings["jiggle_where"] = self.jiggle_where.get()
+        self.ctl.save()
+        self.stop_jiggler()
+        self.jiggle_on.set(False)
+        if self.jiggle_where.get() == "buddy":
+            self.send_buddy_jiggle(None)             # shows what the Buddy is doing now
+        else:
+            self.set_jiggle_state(False)
+
+    def send_buddy_jiggle(self, body):
+        """body None only reads the Buddy's jiggler. The answer comes back as a "jbuddy" event."""
+        def work():
+            state, why = self.ctl.buddy_jiggle(body)
+            self.events.put(("jbuddy", state, why))
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_jiggler(self):
+        mode, interval, distance = self.jiggle_values()
+        try:
+            backend = jiggler.default_backend()
+        except (jiggler.JigglerError, OSError, ImportError) as e:
+            self.jiggle_on.set(False)
+            self.say(f"Mouse jiggler not started: {e}")
+            return
+        self.jiggler = jiggler.Jiggler(backend, mode, interval, distance,
+                                       on_event=lambda text: self.events.put(("jiggle", text)))
+        self.jiggler.start()
+        self.set_jiggle_state(True)
+
+    def stop_jiggler(self):
+        if self.jiggler:
+            self.jiggler.stop()
+            self.jiggler = None
+        self.set_jiggle_state(False)
+
     # ── actions ───────────────────────────────────────────
     def tick_clock(self):
         time_s, weekday, day = bp.clock_page(dt.datetime.now())
@@ -904,11 +1220,33 @@ class App:
         for key in keys or ("weather", "stock", "github"):
             threading.Thread(target=self.page_worker, args=(key,), daemon=True).start()
         if keys is None:
+            threading.Thread(target=self.time_worker, daemon=True).start()   # keeps the Buddy's clock right
+            if self.ctl.feed_enabled() and not self.auto.get():              # usage: see feed_now
+                threading.Thread(target=self.usage_worker, daemon=True).start()
             self.root.after(REFRESH_SECONDS * 1000, self.refresh_network_pages)
+
+    def feed_now(self):
+        """Fetch everything and send it to the Buddy now (the pages also refresh on screen)."""
+        if self.ctl.feed_enabled():
+            self.refresh_network_pages(["weather", "stock", "github"])
+            threading.Thread(target=self.time_worker, daemon=True).start()
+            # The Claude and Codex pages exist on the Buddy only after a push (and are gone
+            # after every restart), so a connect/feed brings them back at once.
+            threading.Thread(target=self.usage_worker, daemon=True).start()
+
+    def time_worker(self):
+        ok, msg = self.ctl.feed_time()
+        if ok is False:
+            self.events.put(("fed", "time", False, msg))
 
     def page_worker(self, key):
         try:
-            self.events.put(("page", key, self.ctl.fetch_page(key), None))
+            data = self.ctl.fetch_page(key)
+            self.events.put(("page", key, data, None))
+            if key in bp.FEED_COMMANDS:
+                ok, msg = self.ctl.feed_page(key, data)
+                if ok is not None:
+                    self.events.put(("fed", key, ok, msg))
         except bp.FetchError as e:
             self.events.put(("page", key, None, str(e)))
         except Exception as e:   # a page must never take the app down
@@ -1005,10 +1343,64 @@ class App:
                     else:
                         self.say(f"Could not set the status: {msg}")
                     self.mark()
+                elif ev[0] == "agent":
+                    _, state, why = ev
+                    if state is None:
+                        self.agent_on.set(False)
+                        self.agent_pin.set(False)
+                        self.say(f"AI agent screen saver: {why}")
+                    else:
+                        self.agent_on.set(state["show"])
+                        self.agent_pin.set(state["pin"])
+                        self.agent_text.set(state["text"])
+                        if self.agent_said != state["show"]:
+                            self.agent_said = state["show"]
+                            self.say("AI agent screen saver is " + ("on" if state["show"] else "off")
+                                     + f" on the Buddy (\u201c{state['text']}\u201d).")
+                elif ev[0] == "rotated":
+                    _, mount, why = ev
+                    if mount is None:
+                        self.setup_note.configure(text=why)
+                        self.say(f"Could not turn the screen: {why}")
+                    else:
+                        self._filling = True        # not an edit the user has to save
+                        try:
+                            self.cfg_vars["mount"].set(mount)
+                        finally:
+                            self._filling = False
+                        self.cfg_dirty.discard("mount")
+                        self.setup_note.configure(text=f"Screen turned 180\u00b0 (side: {mount}). Saved on the Buddy.")
+                        self.say(f"Screen turned 180\u00b0 on the Buddy (side: {mount}).")
+                elif ev[0] == "jbuddy":
+                    _, state, why = ev
+                    if state is None:
+                        self.say(f"Buddy mouse jiggler: {why}")
+                        self.jiggle_on.set(False)
+                        self.set_jiggle_state(False)
+                    else:
+                        self.jiggle_on.set(bool(state["enabled"]))
+                        self.set_jiggle_state(bool(state["enabled"]))
+                        if self.jiggle_where.get() == "buddy" and not self.jbuddy_said:
+                            self.jbuddy_said = True
+                            self.say(f"Buddy mouse jiggler is {'on' if state['enabled'] else 'off'} "
+                                     f"({state['mode']}, every {state['interval']} s, up to {state['distance']} px).")
+                elif ev[0] == "jiggle":
+                    self.say(ev[1])
+                    if ev[1].startswith("Mouse jiggler stopped"):   # the thread gave up (e.g. permission)
+                        self.jiggle_on.set(False)
+                        self.jiggler = None
+                        self.set_jiggle_state(False)
                 elif ev[0] == "read":
                     self.show_usage(ev[1])
                 elif ev[0] == "page":
                     self.show_page(*ev[1:])
+                elif ev[0] == "fed":
+                    _, key, ok, msg = ev
+                    if not ok:
+                        self.say(f"Could not send the {key} to the Buddy: {msg}")
+                    elif key not in self.fed_said:      # say it once, not every 10 minutes
+                        self.fed_said.add(key)
+                        self.say(f"Sent the {key} to the Buddy over USB.")
                 elif ev[0] == "setup_read":
                     if ev[2]:
                         self.setup_note.configure(text=ev[2])
@@ -1065,7 +1457,8 @@ class App:
 
 def main():
     root = tk.Tk()
-    App(root, Controller())
+    app = App(root, Controller())
+    root.protocol("WM_DELETE_WINDOW", lambda: (app.stop_jiggler(), root.destroy()))
     root.mainloop()
 
 

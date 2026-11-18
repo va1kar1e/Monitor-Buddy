@@ -10,6 +10,7 @@ so the tests need no internet. Standard library only.
 """
 import datetime as dt
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -77,6 +78,7 @@ def weather_page(lat, lon, fahrenheit=False, mph=False, fetch=fetch_json):
         raise FetchError("the weather service sent nothing usable")
     return {"temp": round(cur["temperature_2m"]), "humidity": round(cur.get("relative_humidity_2m", 0)),
             "wind": round(cur.get("wind_speed_10m", 0)), "text": weather_text(int(cur.get("weather_code", -1))),
+            "code": int(cur.get("weather_code", -1)),
             "is_day": bool(cur.get("is_day", 1)), "unit": "F" if fahrenheit else "C",
             "wind_unit": "MPH" if mph else "KMH"}
 
@@ -107,3 +109,30 @@ def stock_page(ticker, key, fetch=fetch_json):
     prev = d.get("pc") or 0
     return {"price": d["c"], "open": d.get("o", 0), "high": d.get("h", 0), "low": d.get("l", 0),
             "change_pct": (d["c"] - prev) / prev * 100 if prev else 0.0}
+
+
+# ── What the Buddy is sent when it has no Wi-Fi ───────────────────────────
+# The bodies of "@MB WEATHER / STOCK / GITHUB / TIME" (lib/feed in the firmware): the
+# same numbers the Buddy would have fetched itself, so its pages work over USB alone.
+FEED_COMMANDS = {"weather": "WEATHER", "stock": "STOCK", "github": "GITHUB"}
+
+
+def feed_body(key, d, ticker=""):
+    """The body for one page's numbers `d` (what weather_page, stock_page or github_page returned)."""
+    if key == "weather":
+        return {"temp": d["temp"], "humidity": d["humidity"], "wind": d["wind"],
+                "code": max(0, d.get("code", 0)), "is_day": d["is_day"]}
+    if key == "stock":
+        body = {"price": d["price"], "open": d["open"], "high": d["high"], "low": d["low"]}
+        symbol = (ticker or "").strip().upper()
+        if symbol:
+            body["symbol"] = symbol
+        return body
+    if key == "github":
+        return {"followers": d["followers"], "repos": d["repos"]}
+    raise ValueError(key)
+
+
+def time_body(now=None):
+    """{"epoch": seconds since 1970 UTC}: the Buddy applies its own time zone."""
+    return {"epoch": int(now if now is not None else time.time())}

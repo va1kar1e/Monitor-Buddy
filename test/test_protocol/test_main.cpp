@@ -84,6 +84,15 @@ static void test_parse_usage() {
   TEST_ASSERT_EQUAL(MB_UNKNOWN, mbParse("@MB USAGES", &arg));
   TEST_ASSERT_EQUAL(MB_STATUS, mbParse("@MB STATUS {\"state\":\"busy\"}", &arg));
   TEST_ASSERT_EQUAL_STRING("{\"state\":\"busy\"}", arg);
+  TEST_ASSERT_EQUAL(MB_TIME, mbParse("@MB TIME {\"epoch\":1790000000}", &arg));
+  TEST_ASSERT_EQUAL(MB_WEATHER, mbParse("@MB WEATHER {\"temp\":1}", &arg));
+  TEST_ASSERT_EQUAL(MB_STOCK, mbParse("@MB STOCK {\"price\":1}", &arg));
+  TEST_ASSERT_EQUAL(MB_GITHUB, mbParse("@MB GITHUB {\"followers\":1}", &arg));
+  TEST_ASSERT_EQUAL(MB_UNKNOWN, mbParse("@MB WEATHERS", &arg));
+  TEST_ASSERT_EQUAL(MB_JIGGLE, mbParse("@MB JIGGLE {\"enabled\":true}", &arg));
+  TEST_ASSERT_EQUAL(MB_JIGGLE, mbParse("@MB JIGGLE", &arg));
+  TEST_ASSERT_EQUAL(MB_ROTATE, mbParse("@MB ROTATE", &arg));
+  TEST_ASSERT_EQUAL(MB_AGENT, mbParse("@MB AGENT {\"show\":true}", &arg));
 }
 
 static void test_command_word() {
