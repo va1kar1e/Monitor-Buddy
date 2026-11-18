@@ -1903,7 +1903,7 @@ void drawGithub() {
 // the PC has been quiet for USAGE_STALE_MS.
 static constexpr uint32_t USAGE_STALE_MS = 30UL * 60UL * 1000UL;
 
-// Limit bar: blue under 70 %, yellow from 70 %, red from 90 % (CP AXTRA palette).
+// Limit bar: blue under 70 %, yellow from 70 %, red from 90 % (the palette used on the status page).
 // `right` is the text after the bar; null shows the percentage. A bar past 100 %
 // stays full.
 static void drawUsageBar(int y, const char *label, int pct, const char *right = nullptr) {
@@ -1980,8 +1980,8 @@ void drawCodex()  { drawUsagePage("CODEX",  rgb(67,147,143), netView.codex); }
 // ── Status page ───────────────────────────────────────────
 uint8_t statusState = STATUS_FREE;
 
-// The word fills the screen on a colour per state (Lotus green, Makro red,
-// CP AXTRA yellow); black text on the yellow, white on the others.
+// The word fills the screen on a colour per state (green, red,
+// the palette yellow); black text on the yellow, white on the others.
 void drawStatus() {
   const uint16_t bgs[STATUS_COUNT] = {rgb(67,147,143), rgb(218,56,50), rgb(246,194,74)};
   const uint16_t bg = bgs[statusState % STATUS_COUNT];

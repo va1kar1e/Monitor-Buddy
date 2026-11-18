@@ -51,7 +51,7 @@ TZ_PRESETS = [("Bangkok (UTC+7)", "Asia/Bangkok", "<+07>-7"), ("Singapore (UTC+8
 SETUP_PAGES = [("face", "Face"), ("clock", "Clock"), ("date", "Date"), ("weather", "Weather"),
                ("stock", "Stock"), ("github", "GitHub")]   # the moon page no longer exists
 
-# CP AXTRA palette.
+# Colour palette.
 BLUE, YELLOW, GREEN, RED = "#306FC7", "#F6C24A", "#43938F", "#DA3832"
 GRAY = "#666666"
 STATES = [("free", "Free", GREEN, "white"), ("busy", "Busy", RED, "white"),
