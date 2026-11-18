@@ -295,7 +295,7 @@ class Window(unittest.TestCase):
             root.withdraw()
             app = ba.App(root, controller(), autostart=False)
             self.assertEqual(set(app.buttons), {"free", "busy", "meeting"})
-            self.assertEqual(app.listbox.size(), len(ba.bp.PAGES) + 1)   # and Setup
+            self.assertEqual(app.listbox.size(), len(ba.bp.PAGES) + 2)   # and Mouse Jiggler, Setup
             app.show_page("weather", {"temp": 31, "humidity": 70, "wind": 9, "text": "CLEAR", "is_day": True,
                                       "unit": "C", "wind_unit": "KMH"}, None)
             self.assertEqual(app.page_labels[("weather", "temp")].cget("text"), "31\u00b0C")
@@ -330,6 +330,294 @@ class Window(unittest.TestCase):
                              "Month $348.95 of $400  (87%)  Limit 42%  resets in 2 h 14 m")
         finally:
             root.destroy()
+
+
+class JigglerWindow(unittest.TestCase):
+    def test_jiggler_controls(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest("no display")
+        try:
+            root.withdraw()
+            ctl = controller()
+            app = ba.App(root, ctl, autostart=False)
+            self.assertTrue(app.feed.get())                 # feeding the Buddy is on by default
+            app.feed.set(False)
+            app.on_feed()
+            self.assertFalse(ctl.settings["feed"])
+            self.assertFalse(app.jiggle_on.get())           # never starts on by itself
+            self.assertIn("jiggler", app.page_frames)       # it has its own menu entry
+            self.assertIn("Mouse Jiggler", [label for _, label in app.pages])
+            self.assertEqual(app.jiggle_state.cget("text"), "OFF")
+            started = []
+
+            class Fake(ba.jiggler.Jiggler):
+                def start(self):
+                    started.append((self.mode, self.interval, self.distance))
+                    self.thread = None
+
+            with mock.patch.object(ba.jiggler, "default_backend", lambda: object()), \
+                 mock.patch.object(ba.jiggler, "Jiggler", Fake):
+                app.jiggle_mode.set("steady")
+                app.jiggle_interval.set(9999)                # clamped to 3600
+                app.jiggle_distance.set(0)                   # clamped to 1
+                app.jiggle_on.set(True)
+                app.on_jiggle()
+            self.assertEqual(started, [("steady", 3600.0, 1)])
+            self.assertEqual(ctl.settings["jiggle_mode"], "steady")
+            self.assertEqual(ctl.settings["jiggle_interval"], 3600)
+            self.assertEqual(app.jiggle_state.cget("text"), "ON")
+            app.stop_jiggler()
+            self.assertIsNone(app.jiggler)
+            self.assertEqual(app.jiggle_state.cget("text"), "OFF")
+            # a backend that cannot start (no permission) leaves the box unticked and says why
+            with mock.patch.object(ba.jiggler, "default_backend",
+                                   side_effect=ba.jiggler.JigglerError("no permission")):
+                app.jiggle_on.set(True)
+                app.on_jiggle()
+            self.assertFalse(app.jiggle_on.get())
+            self.assertIn("no permission", app.log.get("1.0", "end"))
+            # the thread giving up later (event from the worker) also unticks it
+            app.jiggle_on.set(True)
+            app.events.put(("jiggle", "Mouse jiggler stopped: boom"))
+            app.drain()
+            self.assertFalse(app.jiggle_on.get())
+        finally:
+            root.destroy()
+
+
+class Feeding(unittest.TestCase):
+    DATA = {"temp": 31, "humidity": 70, "wind": 9, "code": 1, "is_day": True, "text": "CLEAR",
+            "unit": "C", "wind_unit": "KMH"}
+
+    def test_sends_weather_over_usb(self):
+        c = controller(mode="usb", port="COM11", feed=True)
+        with mock.patch.object(up, "push_serial", return_value=(True, "")) as ps:
+            self.assertEqual(c.feed_page("weather", self.DATA), (True, ""))
+        ps.assert_called_once_with("COM11", {"temp": 31, "humidity": 70, "wind": 9, "code": 1, "is_day": True},
+                                   command="WEATHER")
+
+    def test_stock_carries_the_ticker(self):
+        c = controller(mode="usb", port="COM11", feed=True, ticker="avgo")
+        with mock.patch.object(up, "push_serial", return_value=(True, "")) as ps:
+            c.feed_page("stock", {"price": 10, "open": 9, "high": 11, "low": 8, "change_pct": 1})
+        self.assertEqual(ps.call_args.args[1]["symbol"], "AVGO")
+        self.assertEqual(ps.call_args.kwargs["command"], "STOCK")
+
+    def test_time(self):
+        c = controller(mode="usb", port="COM11", feed=True)
+        with mock.patch.object(up, "push_serial", return_value=(True, "")) as ps:
+            self.assertEqual(c.feed_time(), (True, ""))
+        self.assertEqual(ps.call_args.kwargs["command"], "TIME")
+        self.assertGreater(ps.call_args.args[1]["epoch"], 1700000000)
+
+    def test_does_nothing_when_off_or_not_usb_or_no_port(self):
+        for cfg in ({"feed": False}, {"mode": "wifi", "host": "1.2.3.4"}, {"port": ""}):
+            base = {"mode": "usb", "port": "COM11", "feed": True}
+            base.update(cfg)
+            c = controller(**base)
+            with mock.patch.object(up, "push_serial") as ps:
+                self.assertEqual(c.feed_page("weather", self.DATA), (None, ""), cfg)
+                self.assertEqual(c.feed_time(), (None, ""), cfg)
+            ps.assert_not_called()
+
+    def test_refusal_is_reported_and_old_firmware_is_explained(self):
+        c = controller(mode="usb", port="COM11", feed=True)
+        with mock.patch.object(up, "push_serial", return_value=(False, "temp must be a number")):
+            self.assertEqual(c.feed_page("weather", self.DATA), (False, "temp must be a number"))
+        with mock.patch.object(up, "push_serial", return_value=(False, "unknown command")):
+            ok, msg = c.feed_time()
+        self.assertFalse(ok)
+        self.assertIn("firmware is too old", msg)
+
+    def test_on_by_default(self):
+        self.assertTrue(controller().settings["feed"])
+
+
+class BuddyJiggler(unittest.TestCase):
+    def test_sends_and_returns_the_state(self):
+        c = controller(mode="usb", port="COM11")
+        reply = {"ok": True, "cmd": "JIGGLE", "supported": True, "enabled": True, "mode": "random",
+                 "interval": 30, "distance": 5}
+        with mock.patch.object(up, "serial_command", return_value=(reply, "")) as sc:
+            state, why = c.buddy_jiggle({"enabled": True})
+        sc.assert_called_once_with("COM11", "JIGGLE", {"enabled": True})
+        self.assertEqual(state, {"enabled": True, "mode": "random", "interval": 30, "distance": 5})
+
+    def test_needs_usb(self):
+        state, why = controller(mode="wifi", host="1.2.3.4").buddy_jiggle(None)
+        self.assertIsNone(state)
+        self.assertIn("USB", why)
+
+    def test_old_or_wrong_firmware_is_explained(self):
+        c = controller(mode="usb", port="COM11")
+        with mock.patch.object(up, "serial_command", return_value=({"ok": False, "error": "unknown command"}, "")):
+            self.assertIn("flash the esp32-s3-hid", c.buddy_jiggle(None)[1])
+        err = "the mouse jiggler needs the esp32-s3-hid firmware"
+        with mock.patch.object(up, "serial_command", return_value=({"ok": False, "error": err}, "")):
+            self.assertEqual(c.buddy_jiggle(None), (None, err))
+
+    def test_no_reply(self):
+        c = controller(mode="usb", port="COM11")
+        with mock.patch.object(up, "serial_command", return_value=(None, "no reply")):
+            self.assertEqual(c.buddy_jiggle(None), (None, "no reply"))
+
+
+class BuddyJigglerWindow(unittest.TestCase):
+    def test_switch_and_events(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest("no display")
+        try:
+            root.withdraw()
+            ctl = controller()
+            app = ba.App(root, ctl, autostart=False)
+            self.assertEqual(app.jiggle_where.get(), "computer")
+            sent = []
+            app.send_buddy_jiggle = lambda body: sent.append(body)
+            app.jiggle_where.set("buddy")
+            app.on_jiggle_where()
+            self.assertEqual(ctl.settings["jiggle_where"], "buddy")
+            self.assertEqual(sent, [None])                   # reads the Buddy's state first
+            app.jiggle_mode.set("steady"); app.jiggle_interval.set(12); app.jiggle_distance.set(7)
+            app.jiggle_on.set(True)
+            app.on_jiggle()
+            self.assertEqual(sent[-1], {"enabled": True, "mode": "steady", "interval": 12, "distance": 7})
+            self.assertIsNone(app.jiggler)                   # nothing runs on this computer
+            app.on_jiggle_options()
+            self.assertEqual(sent[-1], {"mode": "steady", "interval": 12, "distance": 7})
+            app.events.put(("jbuddy", {"enabled": True, "mode": "random", "interval": 30, "distance": 5}, ""))
+            app.drain()
+            self.assertTrue(app.jiggle_on.get())
+            self.assertEqual(app.jiggle_state.cget("text"), "ON (on the Buddy)")
+            app.events.put(("jbuddy", None, "the mouse jiggler needs the esp32-s3-hid firmware"))
+            app.drain()
+            self.assertFalse(app.jiggle_on.get())
+            self.assertIn("esp32-s3-hid", app.log.get("1.0", "end"))
+        finally:
+            root.destroy()
+
+
+class Rotate(unittest.TestCase):
+    def test_controller(self):
+        c = controller(mode="usb", port="COM11")
+        with mock.patch.object(up, "serial_command", return_value=({"ok": True, "cmd": "ROTATE", "mount": "right"}, "")) as sc:
+            self.assertEqual(c.rotate_buddy(), ("right", ""))
+        sc.assert_called_once_with("COM11", "ROTATE")
+        self.assertIn("USB", controller(mode="wifi", host="1.2.3.4").rotate_buddy()[1])
+        with mock.patch.object(up, "serial_command", return_value=({"ok": False, "error": "unknown command"}, "")):
+            self.assertIn("too old", c.rotate_buddy()[1])
+        with mock.patch.object(up, "serial_command", return_value=(None, "no reply")):
+            self.assertEqual(c.rotate_buddy(), (None, "no reply"))
+
+    def test_window_updates_screen_side_without_marking_it_changed(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest("no display")
+        try:
+            root.withdraw()
+            app = ba.App(root, controller(), autostart=False)
+            app.cfg_vars["mount"].set("left")
+            app.cfg_dirty.clear()
+            app.events.put(("rotated", "right", ""))
+            app.drain()
+            self.assertEqual(app.cfg_vars["mount"].get(), "right")
+            self.assertNotIn("mount", app.cfg_dirty)
+            app.events.put(("rotated", None, "no reply"))
+            app.drain()
+            self.assertIn("no reply", app.log.get("1.0", "end"))
+        finally:
+            root.destroy()
+
+
+class AgentScreenSaver(unittest.TestCase):
+    def test_controller(self):
+        c = controller(mode="usb", port="COM11")
+        ok = {"ok": True, "cmd": "AGENT", "show": True, "pin": True, "text": "DON'T TOUCH my laptop"}
+        with mock.patch.object(up, "serial_command", return_value=(ok, "")) as sc:
+            state, why = c.agent_buddy(True, "DON'T TOUCH my laptop")
+        sc.assert_called_once_with("COM11", "AGENT", {"show": True, "text": "DON'T TOUCH my laptop"})
+        self.assertEqual(state, {"show": True, "pin": True, "text": "DON'T TOUCH my laptop"})
+        with mock.patch.object(up, "serial_command", return_value=(ok, "")) as sc:
+            c.agent_buddy(pin=True)
+        sc.assert_called_once_with("COM11", "AGENT", {"pin": True})
+        with mock.patch.object(up, "serial_command", return_value=(ok, "")) as sc:
+            c.agent_buddy()
+        sc.assert_called_once_with("COM11", "AGENT", None)       # nothing to change: only reads
+        with mock.patch.object(up, "serial_command", return_value=(ok, "")) as sc:
+            c.agent_buddy(text="")                              # "" = the default again, sent as is
+        sc.assert_called_once_with("COM11", "AGENT", {"text": ""})
+        self.assertIn("USB", controller(mode="wifi", host="1.2.3.4").agent_buddy(True)[1])
+        with mock.patch.object(up, "serial_command", return_value=({"ok": False, "error": "unknown command"}, "")):
+            self.assertIn("too old", c.agent_buddy(True)[1])
+
+    def test_text_is_checked_before_sending(self):
+        c = controller(mode="usb", port="COM11")
+        with mock.patch.object(up, "serial_command") as sc:
+            for bad in ("x" * 25, "caf\u00e9", "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35", "   "):
+                state, why = c.agent_buddy(text=bad)
+                self.assertIsNone(state)
+                self.assertTrue(why, bad)
+        sc.assert_not_called()
+        self.assertIsNone(ba.agent_text_problem("DON'T TOUCH my laptop"))
+        self.assertIsNone(ba.agent_text_problem(""))
+        self.assertIsNone(ba.agent_text_problem("x" * 24))
+
+    def test_window(self):
+        import tkinter as tk
+        try:
+            root = tk.Tk()
+        except tk.TclError:
+            self.skipTest("no display")
+        try:
+            root.withdraw()
+            app = ba.App(root, controller(), autostart=False)
+            sent = []
+            app.send_agent = lambda show, text=None, pin=None: sent.append((show, text, pin))
+            app.agent_on.set(True)
+            app.on_agent()
+            app.agent_text.set("DON'T TOUCH my laptop")
+            app.on_agent_text()
+            app.agent_pin.set(True)
+            app.on_agent_pin()
+            self.assertEqual(sent, [(True, None, None), (None, "DON'T TOUCH my laptop", None), (None, None, True)])
+            app.events.put(("agent", {"show": True, "pin": True, "text": "HANDS OFF"}, ""))
+            app.drain()
+            self.assertTrue(app.agent_on.get())
+            self.assertTrue(app.agent_pin.get())
+            self.assertEqual(app.agent_text.get(), "HANDS OFF")
+            self.assertIn("screen saver is on", app.log.get("1.0", "end"))
+            app.events.put(("agent", None, "no reply"))
+            app.drain()
+            self.assertFalse(app.agent_on.get())
+            self.assertIn("no reply", app.log.get("1.0", "end"))
+        finally:
+            root.destroy()
+
+
+class UsablePortsTest(unittest.TestCase):
+    class P:
+        def __init__(self, device):
+            self.device = device
+
+    def test_macos_noise_and_tty_twins_are_dropped(self):
+        ports = [self.P(d) for d in ("/dev/cu.Bluetooth-Incoming-Port", "/dev/cu.debug-console",
+                                     "/dev/cu.usbmodem1101", "/dev/tty.usbmodem1101")]
+        self.assertEqual([p.device for p in ba.usable_ports(ports)], ["/dev/cu.usbmodem1101"])
+
+    def test_tty_kept_when_it_has_no_cu_twin(self):
+        ports = [self.P("/dev/tty.usbmodem7")]
+        self.assertEqual(len(ba.usable_ports(ports)), 1)
+
+    def test_windows_and_linux_ports_pass_through(self):
+        ports = [self.P("COM11"), self.P("/dev/ttyACM0")]
+        self.assertEqual(len(ba.usable_ports(ports)), 2)
 
 
 if __name__ == "__main__":

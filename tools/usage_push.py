@@ -44,6 +44,7 @@ Standard library only, plus pyserial for --serial.
 import argparse
 import datetime as dt
 import json
+import platform
 import os
 import secrets
 import sys
@@ -296,6 +297,43 @@ def push(base, token, body, timeout=8, path="/usage"):
             return e.code, None
 
 
+ESPRESSIF_VID, JTAG_PID = 0x303A, 0x1001
+
+
+def native_cdc(port):
+    """True when `port` is the Buddy's TinyUSB CDC port (firmware env esp32-s3-hid) rather than
+    the S3/C6's USB-Serial-JTAG one (pid 0x1001). The two want different DTR/RTS handling."""
+    try:
+        from serial.tools import list_ports
+        for p in list_ports.comports():
+            if p.device == port:
+                return p.vid == ESPRESSIF_VID and p.pid not in (None, JTAG_PID)
+    except Exception:   # no pyserial listing: treat it as the usual JTAG port
+        pass
+    return False
+
+
+def quiet_open_prepare(ser):
+    """Call before ser.open(). USB-Serial-JTAG restarts the board when it sees the reset
+    pattern on DTR/RTS: Windows and Linux are fine with both low before opening; macOS
+    raises both on open whatever was set, so there it is done after (quiet_open_finish).
+    The TinyUSB CDC port is the opposite: it only sends while DTR is high (and never
+    resets on it), so DTR goes high and RTS low."""
+    if native_cdc(ser.port):
+        ser.dtr, ser.rts = True, False
+    elif platform.system() != "Darwin":
+        ser.dtr = False
+        ser.rts = False
+
+
+def quiet_open_finish(ser):
+    """Call right after ser.open(). RTS first, then DTR: lowering DTR first is the
+    JTAG chip's reset pattern (DTR low with RTS still high), which restarted the Buddy on
+    every open on macOS, wiping what had just been pushed to it."""
+    ser.rts = False
+    ser.dtr = native_cdc(ser.port)
+
+
 def serial_command(port, command, body=None, timeout=3.0):
     """Send "@MB <command> [<body>]" and wait for the reply. Returns (reply, "") with
     the reply as a dict, or (None, why)."""
@@ -303,21 +341,26 @@ def serial_command(port, command, body=None, timeout=3.0):
         import serial
     except ImportError:
         raise SystemExit("--serial needs pyserial:  pip install pyserial")
-    # DTR/RTS low before opening: on the S3's USB port a raised line resets the board.
     ser = serial.Serial()
     ser.port, ser.baudrate, ser.timeout = port, 115200, 0.2
-    ser.dtr = False
-    ser.rts = False
+    quiet_open_prepare(ser)
     line_out = b"@MB " + command.encode()
     if body is not None:
         line_out += b" " + json.dumps(body, separators=(",", ":")).encode()
     try:
         ser.open()
+        quiet_open_finish(ser)
         ser.write(line_out + b"\n")
         deadline = time.time() + timeout
         buf = b""
+        extended = False
         while time.time() < deadline:
             buf += ser.read(256)
+            if not extended and b"ESP-ROM" in buf:
+                # The board restarted when the port opened and answers once it has booted
+                # (up to about 20 s with no Wi-Fi to find): wait for it.
+                deadline = max(deadline, time.time() + 30)
+                extended = True
             for line in buf.split(b"\n"):
                 line = line.strip()
                 if not line.startswith(b"@MB "):

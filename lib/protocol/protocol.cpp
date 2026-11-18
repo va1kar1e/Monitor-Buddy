@@ -29,7 +29,8 @@ MbCommand mbParse(const char *line, const char **arg) {
   if (space) *arg = space + 1;
   static const struct { const char *name; MbCommand id; } COMMANDS[] = {
     {"INFO", MB_INFO}, {"GET", MB_GET}, {"SET", MB_SET}, {"REBOOT", MB_REBOOT},
-    {"DEFAULTS", MB_DEFAULTS}, {"USAGE", MB_USAGE}, {"STATUS", MB_STATUS}};
+    {"DEFAULTS", MB_DEFAULTS}, {"USAGE", MB_USAGE}, {"STATUS", MB_STATUS},
+    {"TIME", MB_TIME}, {"WEATHER", MB_WEATHER}, {"STOCK", MB_STOCK}, {"GITHUB", MB_GITHUB}, {"JIGGLE", MB_JIGGLE}, {"ROTATE", MB_ROTATE}, {"AGENT", MB_AGENT}};
   for (const auto &c : COMMANDS)
     if (strlen(c.name) == n && strncmp(cmd, c.name, n) == 0) return c.id;
   return MB_UNKNOWN;

@@ -84,6 +84,19 @@ No Wi-Fi, or no wish to pair? Use the USB cable instead: `pip install pyserial`,
 
 Over Wi-Fi the first push pairs the Buddy with a random token stored in `~/.monitor-buddy-usage-token`; any other computer is then refused. The numbers travel as plain HTTP on your own network, so use this only on a network you trust. To pair a different computer, erase the Buddy's settings storage once: `esptool --port <port> erase-region 0x9000 0x5000` (Wi-Fi and display settings are kept, they are in LittleFS).
 
+### Mouse jiggler on the Buddy itself (ESP32-S3, optional)
+
+The desktop app's **Mouse Jiggler** page can run on **This computer** (the app moves the pointer, so it must stay open) or on **The Buddy**. On the Buddy it plugs into the computer as a real USB mouse and nudges the pointer by itself, with no software running on the computer and nothing to grant in macOS. It needs the `esp32-s3-hid` firmware:
+
+```
+pio run -e esp32-s3-hid --target upload
+```
+
+- **What changes:** the S3's USB port normally is the fixed USB-Serial-JTAG block, which cannot be a mouse. This firmware runs the port through TinyUSB as a composite device: a mouse plus a normal serial port (id `303A:4001`, product "Monitor Buddy"). The `@MB` protocol, the desktop app and the pages work as before; opening the serial port no longer restarts the board. The serial tools raise DTR for this port by themselves.
+- **Turn it on:** in the app pick *The Buddy*, tick **Mouse jiggler on**, choose Random or Steady, the interval and the size. Or tap the **MOUSE JIGGLER** page on the Buddy. The setting is saved on the Buddy, so it keeps running after a power cut with the app closed. It is off by default. Over the serial protocol: `@MB JIGGLE {"enabled":true,"mode":"random","interval":30,"distance":5}` (every key optional; with no body it only reads).
+- **Moving between firmwares:** the first flash goes over the old port as usual. After that the board has no automatic reset into upload mode from the new port in every setup: if `pio run -e esp32-s3-hid --target upload` cannot connect, unplug the Buddy, hold **BOOT**, plug it in, release, and run the command again with `--upload-port` set to the port that appears. To go back, flash `esp32-s3` the same way.
+- **Differences:** the move is relative and macOS applies its pointer acceleration, so 20 steps show as roughly 14 pixels. The Buddy cannot see whether you are moving the mouse yourself, so it nudges at its schedule either way (the app version skips a nudge while you use the mouse). The web flasher does not know this firmware yet, and the ESP32-C6 board has no USB-OTG, so it cannot do this.
+
 ### Free / Busy / In a meeting page (optional)
 
 The last page is a status board: the word fills the screen on a colour, **FREE** (green), **BUSY** (red) or **IN A MEETING** (yellow). It starts as Free after every restart.
@@ -94,10 +107,15 @@ The last page is a status board: the word fills the screen on a colour, **FREE**
 ### Desktop app (optional)
 
 A small window with one entry for every page the Buddy shows (Face, Clock, Date, Weather, Stock, GitHub, Claude, Codex, Status, Wi-Fi) and its numbers. Pick the USB port (a Buddy is picked for you) or enter its Wi-Fi address, click **Free**, **Busy** or **In a meeting** on the Status page, and tick **Send usage every 60 seconds** to keep the Claude and Codex pages current. The Buddy fetches its own weather, GitHub and stock numbers, so the app asks the same services with the same settings: **Load from Buddy** (USB) copies the location, GitHub user and ticker from it, and the Stock page needs your Finnhub key typed in (kept in `~/.monitor-buddy-app.json`, plain text). The Wi-Fi page shows the network name and IP address the Buddy reports over USB.
+- **No Wi-Fi needed (USB feed).** With **Feed the Buddy the time, weather, stock and GitHub over USB** ticked (it is by default, and only works over the USB cable), the app fetches those numbers itself and sends them to the Buddy: the clock is set from your computer (in the Buddy's own time zone), and the Weather, Stock and GitHub pages show the app's numbers even when the Buddy has no Wi-Fi at all. It sends them when you connect and every 10 minutes after that, so keep the app open. The Stock and GitHub pages appear by themselves with the first numbers, no key or user has to be saved on the Buddy. It needs the firmware from this version; an older Buddy answers "unknown command" and the app says to update it. Over the serial protocol these are `@MB TIME {"epoch":…}`, `@MB WEATHER {"temp","humidity","wind","code","is_day"}`, `@MB STOCK {"symbol","price","open","high","low"}` and `@MB GITHUB {"followers","repos"}`.
+- **AI agent screen saver** (a tick box on the Status page, USB only): puts a page in the Buddy's AI section that says **AI AGENT IS RUNNING, DON'T TOUCH THIS MAC**, with a pulsing dot and text that drifts slowly so no pixel stays lit. Tick it while an agent is working on the computer and untick it when none is. **Pin it** makes the Buddy go to that page and stay on it: the automatic page scrolling no longer moves off it (a swipe still does, and the scrolling goes on from the page you swipe to), and a pinned Buddy starts on it after a power cut. The **last line** (DON'T TOUCH THIS MAC by default) can be changed in the box under it: up to 24 letters, digits or punctuation, empty for the default. Both are saved on the Buddy, and the page is off by default. Over the serial protocol: `@MB AGENT {"show":true,"pin":true,"text":"DON'T TOUCH my laptop"}`, each key optional (no body only reads).
+- **Rotate 180°** (a button on the Setup page, USB only) turns the Buddy's screen and touch around at once, with no restart, and keeps it: it flips *Screen side* between left and right. The same from the Buddy: hold a finger still on the screen for 1.2 to 2.4 seconds, then lift. (Holding on to 2.5 seconds opens the Wi-Fi hotspot instead.) Over the serial protocol: `@MB ROTATE`, or `@MB ROTATE {"mount":"right"}` to set a side.
 - **Setup** (the last entry, USB only) edits the Buddy's own settings: screen side, colour theme, time zone, location, units, GitHub user, ticker, Finnhub key and which pages show. It reads them from the Buddy, sends only what you changed, and the Buddy checks every value and restarts when it saves. The **Wi-Fi networks** tab keeps a list of networks (**Add**, **Edit**, **Delete**); **Send to Buddy** makes the selected one the Buddy's network. The Buddy itself remembers one network at a time. Passwords are kept as plain text in `~/.monitor-buddy-app.json` (untick *Keep the password* to be asked each time).
 
+- **Mouse Jiggler** (its own entry in the page list, before Setup): tick it to nudge the pointer so the computer does not go idle. **Steady** makes the same small move every N seconds; **Random** moves a random distance in a random direction at random times (0.5 to 1.5 times N). The pointer always goes out and comes back, and a nudge is skipped while you are moving the mouse yourself. Interval (1 to 3600 s) and size (1 to 50 px) are kept; the jiggler itself always starts off. Windows needs nothing. **macOS** asks for Accessibility permission (System Settings → Privacy & Security → Accessibility → switch Monitor Buddy on) and the app says so if it is missing. Linux needs `xdotool` on an X11 session.
 - **Windows:** `MonitorBuddy.exe`. **macOS:** `MonitorBuddy.dmg`, drag the app to Applications. Both are built by the *Desktop app* workflow: open the run in the **Actions** tab and download them from **Artifacts**.
-- The apps are not code-signed, so the first start gets a warning. Windows: **More info → Run anyway**. macOS: right-click the app → **Open** → **Open** (or allow it under System Settings → Privacy & Security).
+- The apps are not code-signed, so the first start gets a warning. Windows: **More info → Run anyway**. macOS: right-click the app → **Open** → **Open** (or allow it under System Settings → Privacy & Security). If macOS says the app is damaged, run `xattr -dr com.apple.quarantine /Applications/MonitorBuddy.app` once.
+- macOS has two downloads: `monitor-buddy-app-macos-apple-silicon` (M1 and newer) and `monitor-buddy-app-macos-intel`. The USB port of a Buddy shows up as `/dev/cu.usbmodem…`. With Wi-Fi mode, macOS may ask once to let the app find devices on the local network: allow it.
 - From source: `pip install pyserial` and `python tools/buddy_app.py`. To build the app yourself: `pip install pyinstaller pyserial` and `python tools/build_app.py` (it builds for the system it runs on).
 - Settings are kept in `~/.monitor-buddy-app.json`. Only one program can use the USB port at a time, so close the app before using the web flasher.
 
@@ -130,7 +148,7 @@ Open the [web flasher](https://idefixrc.github.io/Monitor-Buddy/) and follow [ch
 
 ### d) Apply power and enjoy your new monitor friend
 
-Plug in the USB-C cable. If you gave it your Wi-Fi in the web flasher, it connects straight away. With no Wi-Fi configured, it opens its setup hotspot instead (see [4.9](#49-first-boot-connect-it-to-wi-fi)).
+Plug in the USB-C cable. If you gave it your Wi-Fi in the web flasher, it connects straight away. With no Wi-Fi configured, it opens its setup hotspot instead (see [4.9](#49-first-boot-connect-it-to-wi-fi)). If a saved network cannot be reached (you took the Buddy somewhere else, the router is off), it does not open the hotspot: it runs offline, keeps retrying in the background, and the desktop app can feed it the time, weather, stock and GitHub over USB. Hold the screen for 3 seconds to open the hotspot yourself.
 
 If you print one, **post a picture of your build on MakerWorld**, and if the model saved you some time, a like or a boost is appreciated. 🙏
 
@@ -294,13 +312,25 @@ To change the Wi-Fi later, **press and hold anywhere on the touchscreen for abou
 
 ### 4.10 Everyday controls
 
+Weather, Stock and GitHub only appear while they have numbers (fetched, or sent by the desktop app) or while Wi-Fi is up to fetch them, so a Buddy with no Wi-Fi does not show pages that only ask for it.
+
+The pages are in three **sections**, in this order: MAIN, AI, SETTINGS. Swipe up or down to change section, left or right to move between the pages of the current one; the automatic page scrolling stays inside the section you are in.
+
+| Section  | Pages                                                                                      |
+| -------- | ------------------------------------------------------------------------------------------ |
+| MAIN     | Face, Clock, Date, Weather, Stock, GitHub (those switched on), then Free / Busy            |
+| AI       | The "AI agent is running, don't touch this Mac" screen saver (when switched on), and Claude and Codex usage once a computer has pushed numbers (the section is skipped when it has nothing) |
+| SETTINGS | Wi-Fi network and IP, and the mouse jiggler (esp32-s3-hid firmware only)                   |
+
 | Do this                                         | What happens                                                                                     |
 | ----------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| Swipe left / right                              | Next / previous page                                                                             |
-| Swipe up / down                                 | Brighter / dimmer. Keep dragging for bigger steps. The level is remembered across restarts.      |
+| Swipe left / right                              | Next / previous page **in the current section**                                                  |
+| Swipe up / down                                 | Next / previous **section** (the dots at the right edge show which)                              |
+| Drag up / down starting at the right edge       | Brighter / dimmer (the strip is the last 46 px). Keep dragging for bigger steps. The level is remembered across restarts. |
 | Tap the face                                    | Change the expression                                                                            |
 | Double-tap                                      | Stop or restart the automatic page scrolling                                                     |
 | Tilt or move the Buddy                          | The eyes follow the motion                                                                       |
+| Hold still for 1.2 to 2.4 seconds, then lift   | Turn the screen 180° (the same as switching *Screen side* between left and right, saved, no restart) |
 | Hold the screen still for about 3 seconds       | Open the Wi-Fi setup hotspot. Hold again for 3 seconds to close it.                              |
 | **Factory reset**: open the Wi-Fi setup page (hold the screen for 3 seconds) and press **erase** | Erases Wi-Fi, brightness and board settings. Restarts into Wi-Fi setup on its built-in values.    |
 

@@ -46,9 +46,12 @@
 // ------------------------------------------------------------
 //  HOW TO CONFIGURE WI-FI
 // ------------------------------------------------------------
-//  Automatically: if there are no stored credentials, or the
-//  stored ones fail to connect, the captive portal opens by
-//  itself at boot (FallbackPolicy::ON_FAIL).
+//  Automatically: if there are no stored credentials, the captive
+//  portal opens by itself at boot (FallbackPolicy::NO_CREDENTIALS_ONLY).
+//  Stored credentials that fail to connect (out of range, router off)
+//  do NOT open it: the Buddy runs offline, keeps retrying in the
+//  background, and the desktop app can feed it the time, weather,
+//  stock and GitHub over USB. Hold the screen to set up Wi-Fi again.
 //
 //  On demand: PRESS AND HOLD ANYWHERE ON THE TOUCH SCREEN for
 //  ~2.5 s. Works from any page, at any time.
@@ -109,7 +112,28 @@
 #include "protocol.h"
 #include "display_fmt.h"
 #include "usage.h"       // POST /usage body and the usage pages' text (lib/usage)
+#include "feed.h"        // weather/stock/GitHub/time pushed over USB (lib/feed)
+#include <sys/time.h>   // settimeofday() for @MB TIME
 #include "board_pins.h"   // which Waveshare board this is, and its pins (lib/board)
+#include "jiggle.h"       // the Buddy's own mouse jiggler (lib/jiggle)
+
+// env esp32-s3-hid: the S3's USB port runs through TinyUSB (USB-OTG) instead of the fixed
+// USB-Serial-JTAG block, so it can be a composite device: the serial protocol over a
+// CDC port, plus a HID mouse for the jiggler. Serial is then the USBSerial CDC port
+// (the core would otherwise map it to UART0 when CDC-on-boot is off, which is needed so
+// that the HID interface can be added before USB.begin()).
+#ifdef BUDDY_HID_MOUSE
+#include <USB.h>
+#include <USBCDC.h>
+#include "hid_mouse.h"
+// The core declares USBSerial only with CDC-on-boot, so this build makes its own CDC port.
+static USBCDC buddySerial(0);
+#undef Serial
+#define Serial buddySerial
+static const bool JIGGLE_SUPPORTED = true;
+#else
+static const bool JIGGLE_SUPPORTED = false;
+#endif
 
 // Set from the release tag by the release workflow (-DFW_VERSION=\"1.2.0\").
 #ifndef FW_VERSION
@@ -182,6 +206,8 @@
 
 // Hold the touchscreen this long to open the portal on demand.
 #define TOUCH_PORTAL_HOLD_MS     2500UL
+#define TOUCH_EDGE_PX            46       // a vertical drag that starts this close to the right edge sets the brightness
+#define TOUCH_ROTATE_HOLD_MS     1200UL   // still hold of 1.2 s up to the portal's 2.5 s, then lift: turn the screen 180°
 
 // Stock Market Refresh Settings
 // !! API QUOTA HEADS-UP !!  Finnhub's free tier allows 60 API calls per minute.
@@ -256,6 +282,7 @@ struct touch_data_t {
 static uint8_t currentClockHour();
 
 void triggerDoubleTap();
+void rotateScreen();
 
 void resetSharedI2CBus();
 void bsp_touch_init(TwoWire *wire, uint8_t rstPin, uint8_t intPin, uint8_t rotation, uint16_t dispW, uint16_t dispH);
@@ -276,6 +303,8 @@ void centeredText(const char *text, int y, uint8_t size);
 void drawPageDots();
 void drawHeader(const char *title);
 void switchApp(int8_t delta);
+void switchSection(int8_t delta);
+static uint8_t sectionPages(uint8_t sec, uint8_t *out);
 void buildPageList();
 bool wifiConfigured();
 bool githubConfigured();
@@ -298,6 +327,8 @@ void drawUsagePage(const char *title, uint16_t accent, const UsageSlot &u);
 void drawClaude();
 void drawCodex();
 void drawStatus();
+void drawJiggle();
+void drawAgent();
 void drawNetInfo();
 void serviceUsageServer();
 void triggerFaceTap();
@@ -569,7 +600,7 @@ bool bsp_touch_get_coordinates(uint16_t *outX, uint16_t *outY) {
 
 static const int SCREEN_W         = 320;
 static const int SCREEN_H         = 172;
-static const uint8_t APP_COUNT    = 11;   // total number of pages defined
+static const uint8_t APP_COUNT    = 13;   // total number of pages defined
 
 // Page identifiers, in fixed display order. These index the render switch in
 // loop(); which are actually shown is decided by settings.pages.
@@ -592,6 +623,8 @@ static constexpr uint8_t PAGE_CODEX   = 8;
 static constexpr uint8_t PAGE_STATUS  = 9;
 // Last page: the Wi-Fi network and the Buddy's IP address. Always shown.
 static constexpr uint8_t PAGE_NETINFO = 10;
+static constexpr uint8_t PAGE_JIGGLE  = 11;   // only listed on the HID firmware
+static constexpr uint8_t PAGE_AGENT   = 12;   // "AI agent is running" screen saver; listed when switched on (@MB AGENT)
 
 // -- Face expressions (ported from DESKBUDDY-1.0, Edison Science Corner) --
 // 9 moods, cycled by single-tapping the face page. A fast spin of the board
@@ -627,8 +660,8 @@ bool settingsStored = false;   // booted from a readable /config.json; GET "stor
 static_assert(PAGE_FACE == 0 && PAGE_CLOCK == 1 && PAGE_DATE == 2 &&
               PAGE_WEATHER == 3 && PAGE_MOON == 4 && PAGE_STOCK == 5 &&
               PAGE_GITHUB == 6, "settings.pages[] is indexed by PAGE_* ids");
-static_assert(SETTINGS_PAGE_COUNT + 4 == APP_COUNT,
-              "settings.pages[] needs one entry per page, except the usage, status and network pages");
+static_assert(SETTINGS_PAGE_COUNT + 6 == APP_COUNT,
+              "settings.pages[] needs one entry per page, except the usage, status, network, jiggler and agent pages");
 
 Arduino_DataBus *bus     = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI);
 Arduino_GFX    *display  = new Arduino_ST7789(bus, LCD_RST, 0, false, 172, 320, 34, 0, 34, 0);
@@ -655,6 +688,20 @@ volatile uint8_t currentApp = 0;  // page shown (PAGE_*); also read by netTask
 uint8_t  pageOrder[APP_COUNT];  // enabled page IDs, built from settings.pages at boot
 uint8_t  pageCount       = 0;   // how many pages are enabled
 uint8_t  currentPageIdx  = 0;   // index into pageOrder[] of the current page
+// The pages are in sections: swipe up/down changes section, swipe left/right (and the
+// auto-scroll) moves between the pages of the current one. pageOrder[] holds just the
+// current section's pages.
+enum : uint8_t { SEC_MAIN = 0, SEC_AI = 1, SEC_SETTINGS = 2, SEC_COUNT = 3 };   // the order of a swipe down
+static const char *const SECTION_NAMES[SEC_COUNT] = {"MAIN", "AI", "SETTINGS"};
+uint8_t  currentSection  = SEC_MAIN;
+uint8_t  sectionLastApp[SEC_COUNT] = {255, 255, 255};   // page last shown in each section
+uint32_t sectionBannerUntil = 0;
+static const char AGENT_TEXT_DEFAULT[] = "DON'T TOUCH THIS MAC";
+char     agentText[25]   = "DON'T TOUCH THIS MAC";   // the page's last line (saved in NVS)
+bool     agentPin        = false;   // stay on the agent page: the auto-scroll does not leave it (saved in NVS)
+bool     agentShow       = false;   // the "AI agent is running" page is in the AI section (saved in NVS)
+bool     netWifiUp       = false;   // Wi-Fi is connected (refreshed about twice a second by loop())
+bool     touchEdgeDrag   = false;   // this press began on the right-edge strip: it sets the brightness
 uint8_t  faceMood        = 0;
 uint16_t touchStartX     = 0;
 uint16_t touchStartY     = 0;
@@ -699,7 +746,8 @@ float pressPulse   = 0.0f;
 // and the draw functions read netView only, so a frame never mixes old and new
 // values. Plain values only (no String), so a copy never touches the heap.
 struct WeatherData { bool valid; int temp, humidity, wind, code; bool isDay; uint32_t updatedAt; };
-struct StockData   { bool valid; float price, open, high, low;   uint32_t updatedAt; };
+struct StockData   { bool valid; float price, open, high, low;   uint32_t updatedAt;
+                     char symbol[12]; };   // set only by a push (@MB STOCK); "" = settings.ticker
 struct GithubData  { bool valid; int followers, repos;            uint32_t updatedAt; };
 struct NetData     { WeatherData weather; StockData stock; GithubData github;
                      UsageSlot claude, codex; };   // written by loop() only (POST /usage)
@@ -932,6 +980,17 @@ void centeredTextColor(const char *text, int y, uint8_t size, uint16_t color) {
 }
 
 void drawPageDots() {
+  // The sections, as a column of dots at the right edge (only when there is more than one).
+  uint8_t avail[SEC_COUNT], n = 0, tmp[APP_COUNT];
+  for (uint8_t sec = 0; sec < SEC_COUNT; sec++)
+    if (sectionPages(sec, tmp) > 0) avail[n++] = sec;
+  if (n > 1) {
+    const int startY = SCREEN_H/2 - ((n-1)*16)/2;
+    for (uint8_t i = 0; i < n; i++) {
+      if (avail[i] == currentSection) gfx->fillCircle(SCREEN_W-9, startY+i*16, 3, FG);
+      else                            gfx->drawCircle(SCREEN_W-9, startY+i*16, 2, rgb(90,90,90));
+    }
+  }
   if (pageCount == 0) return;
   int startX = SCREEN_W/2 - ((pageCount-1)*16)/2;
   for (uint8_t i = 0; i < pageCount; i++) {
@@ -968,23 +1027,46 @@ void drawBootMessage(const char *l1, const char *l2, const char *l3) {
 
 // ── App navigation ────────────────────────────────────────
 
-// Build the list of enabled pages (in fixed order) from settings.pages.
-// Falls back to the Face page if everything is switched off, so the screen is
-// never left blank.
-void buildPageList() {
-  pageCount = 0;
-  for (uint8_t i = 0; i < SETTINGS_PAGE_COUNT; i++) {
-    if (!settings.pages[i]) continue;
-    if (i == PAGE_MOON) continue;                           // removed
-    if (i == PAGE_GITHUB && !githubConfigured()) continue;  // "" hides the page
-    if (i == PAGE_STOCK && !stockConfigured()) continue;    // no key hides the page
-    pageOrder[pageCount++] = i;
+// The pages of one section, in fixed order; returns how many (0: the section does not
+// exist right now). MAIN: the pages switched on in settings.pages, then Free/Busy (the
+// Face page alone when everything is off, so the screen is never blank). SETTINGS: the
+// Wi-Fi page and, on the HID firmware, the mouse jiggler. AI: Claude and Codex usage,
+// which exist once a PC has pushed numbers.
+static uint8_t sectionPages(uint8_t sec, uint8_t *out) {
+  uint8_t n = 0;
+  if (sec == SEC_MAIN) {
+    for (uint8_t i = 0; i < SETTINGS_PAGE_COUNT; i++) {
+      if (!settings.pages[i]) continue;
+      if (i == PAGE_MOON) continue;                           // removed
+      // "" hides the page, unless the desktop app pushed numbers for it (@MB GITHUB / STOCK).
+      if (i == PAGE_GITHUB && !githubConfigured() && !netShared.github.valid) continue;
+      if (i == PAGE_STOCK && !stockConfigured() && !netShared.stock.valid) continue;   // no key hides the page
+      // Weather, stock and GitHub show once they have numbers (fetched, or pushed by the desktop
+      // app) or while Wi-Fi is up to fetch them; with neither they would only say "connect Wi-Fi".
+      const bool wantsData = i == PAGE_WEATHER || i == PAGE_STOCK || i == PAGE_GITHUB;
+      const bool hasData = (i == PAGE_WEATHER && netShared.weather.valid) ||
+                           (i == PAGE_STOCK && netShared.stock.valid) ||
+                           (i == PAGE_GITHUB && netShared.github.valid);
+      if (wantsData && !hasData && !netWifiUp) continue;
+      out[n++] = i;
+    }
+    if (n == 0) out[n++] = PAGE_FACE;
+    out[n++] = PAGE_STATUS;
+  } else if (sec == SEC_SETTINGS) {
+    out[n++] = PAGE_NETINFO;
+    if (JIGGLE_SUPPORTED) out[n++] = PAGE_JIGGLE;
+  } else if (sec == SEC_AI) {
+    if (agentShow) out[n++] = PAGE_AGENT;
+    if (netShared.claude.valid) out[n++] = PAGE_CLAUDE;
+    if (netShared.codex.valid)  out[n++] = PAGE_CODEX;
   }
-  if (netShared.claude.valid) pageOrder[pageCount++] = PAGE_CLAUDE;
-  if (netShared.codex.valid)  pageOrder[pageCount++] = PAGE_CODEX;
-  if (pageCount == 0) pageOrder[pageCount++] = PAGE_FACE;  // never leave it empty
-  pageOrder[pageCount++] = PAGE_STATUS;
-  pageOrder[pageCount++] = PAGE_NETINFO;
+  return n;
+}
+
+// Builds pageOrder[] for the current section, keeping currentPageIdx when it still fits.
+void buildPageList() {
+  if (sectionPages(currentSection, pageOrder) == 0) { currentSection = SEC_MAIN; currentPageIdx = 0; }
+  pageCount = sectionPages(currentSection, pageOrder);
   if (currentPageIdx >= pageCount) currentPageIdx = 0;
   currentApp = pageOrder[currentPageIdx];
 }
@@ -999,7 +1081,29 @@ void rebuildPageListKeepPage() {
   currentApp = pageOrder[currentPageIdx];
 }
 
-// Move to the next/previous ENABLED page (wraps around the enabled list).
+// Move to the next/previous section (wraps; sections that do not exist right now are
+// skipped), landing on the page last shown there.
+void switchSection(int8_t delta) {
+  uint8_t sec = currentSection, tmp[APP_COUNT];
+  for (uint8_t i = 0; i < SEC_COUNT; i++) {
+    sec = (sec + SEC_COUNT + delta) % SEC_COUNT;
+    if (sectionPages(sec, tmp) > 0) break;
+  }
+  if (sec == currentSection || sectionPages(sec, tmp) == 0) return;
+  sectionLastApp[currentSection] = currentApp;
+  currentSection = sec;
+  currentPageIdx = 0;
+  buildPageList();
+  for (uint8_t i = 0; i < pageCount; i++)
+    if (pageOrder[i] == sectionLastApp[sec]) { currentPageIdx = i; break; }
+  currentApp = pageOrder[currentPageIdx];
+  pressPulse = 1.0f;
+  nextAutoPage = millis() + PAGE_AUTO_INTERVAL_MS;
+  sectionBannerUntil = millis() + 1000;
+  Serial.printf("Section: %s\n", SECTION_NAMES[sec]);
+}
+
+// Move to the next/previous page of the current section (wraps).
 void switchApp(int8_t delta) {
   if (pageCount == 0) return;
   currentPageIdx = (currentPageIdx + pageCount + delta) % pageCount;
@@ -1208,7 +1312,7 @@ bool fetchStock() {
   float last = doc["c"].as<float>();
   if (last <= 0.0f) return false;
 
-  StockData s;
+  StockData s = {};                      // symbol "" = the Buddy's own ticker
   s.price     = last;                    // "c" → last price
   s.open      = doc["o"].as<float>();    // "o" → open
   s.high      = doc["h"].as<float>();    // "h" → high
@@ -1705,8 +1809,9 @@ bool drawWifiGate() {
 
 void drawWeather() {
   gfx->fillScreen(BG);
-  if (drawWifiGate()) return;
   const WeatherData &w = netView.weather;
+  // Numbers pushed by the desktop app (or fetched earlier) show with no Wi-Fi too.
+  if (!w.valid && drawWifiGate()) return;
   if (!w.valid) { centeredText("UPDATING", 74, 3); drawPageDots(); return; }
   drawWeatherIcon(250, 66, w.code, w.isDay, COL_WICON);
   gfx->setTextSize(8); gfx->setTextColor(COL_TEMP);
@@ -1729,9 +1834,10 @@ void drawWeather() {
 
 void drawStock() {
   gfx->fillScreen(BG);
-  if (drawWifiGate()) return;
   const StockData &s = netView.stock;
+  if (!s.valid && drawWifiGate()) return;
   if (!s.valid) { centeredText("UPDATING", 74, 3); drawPageDots(); return; }
+  const char *ticker = s.symbol[0] ? s.symbol : settings.ticker;
   char pbuf[16];
   snprintf(pbuf, sizeof(pbuf), "$%.2f", s.price);
   uint16_t priceCol = (s.price >= s.open) ? COL_PRICE_UP : COL_PRICE_DOWN;
@@ -1739,12 +1845,12 @@ void drawStock() {
   // Ticker symbol on the left. Size 4 (twice the Open/High/Low text) for
   // symbols up to 5 characters; 6+ characters shrink so the text still fits
   // the left column, which must end before the O/H/L block at x=150.
-  int tlen  = (int)strlen(settings.ticker);
+  int tlen  = (int)strlen(ticker);
   int tsize = 4;
   while (tsize > 1 && tlen * 6 * tsize > 132) tsize--;   // ~132 px available
   gfx->setTextSize(tsize); gfx->setTextColor(COL_TICKER);
   gfx->setCursor(14, 124 - 4 * tsize);                   // keep it vertically centred
-  gfx->print(settings.ticker);
+  gfx->print(ticker);
   // Open / High / Low on the right side.
   gfx->setTextSize(2); gfx->setTextColor(COL_VALUE);
   gfx->setCursor(150, 92);  gfx->print("OPEN  "); gfx->print(s.open, 2);
@@ -1757,13 +1863,13 @@ void drawStock() {
 
 void drawGithub() {
   gfx->fillScreen(BG);
-  if (!githubConfigured()) {
+  const GithubData &g = netView.github;
+  if (!githubConfigured() && !g.valid) {
     centeredText("NO GITHUB USER", 60, 3);
     centeredText("SET GITHUB USER", 100, 2);
     drawPageDots(); return;
   }
-  if (drawWifiGate()) return;
-  const GithubData &g = netView.github;
+  if (!g.valid && drawWifiGate()) return;
   if (!g.valid) { centeredText("UPDATING", 74, 3); drawPageDots(); return; }
 
   // GitHub logo on the left, filling the vertical space.
@@ -1892,6 +1998,128 @@ void drawStatus() {
     gfx->setTextSize(8);
     gfx->setCursor((SCREEN_W - (int)strlen(w) * 48) / 2, 46); gfx->print(w);
   }
+  drawPageDots();
+}
+
+// ── Mouse jiggler (the HID firmware only) ─────────────────
+// Settings live in NVS (namespace "buddy"), so a jiggler that was turned on keeps
+// running after a power cut with no computer software involved. Off by default.
+JiggleConfig jiggleCfg = JIGGLE_DEFAULT;
+static uint32_t   jiggleNextMs = 0, jiggleBackMs = 0;
+static bool       jiggleFlip = false, jiggleOut = false;
+static JiggleMove jiggleLast = {0, 0};
+
+static void jiggleSchedule() { jiggleNextMs = millis() + jiggleDelayMs(jiggleCfg, esp_random()); }
+
+static void jiggleLoad() {
+  Preferences prefs;
+  prefs.begin("buddy", true);
+  JsonDocument d;
+  d["enabled"]  = prefs.getBool("jig_on", JIGGLE_DEFAULT.enabled);
+  d["mode"]     = jiggleModeName(prefs.getUChar("jig_mode", JIGGLE_DEFAULT.mode));
+  d["interval"] = prefs.getUShort("jig_int", JIGGLE_DEFAULT.intervalS);
+  d["distance"] = prefs.getUChar("jig_dist", JIGGLE_DEFAULT.distance);
+  prefs.end();
+  const char *err;
+  JiggleConfig c = JIGGLE_DEFAULT;
+  if (jiggleParse(d.as<JsonVariantConst>(), c, &err)) jiggleCfg = c;   // out-of-range values: defaults
+  jiggleSchedule();
+}
+
+static void jiggleSave() {
+  Preferences prefs;
+  prefs.begin("buddy", false);
+  prefs.putBool("jig_on", jiggleCfg.enabled);
+  prefs.putUChar("jig_mode", jiggleCfg.mode);
+  prefs.putUShort("jig_int", jiggleCfg.intervalS);
+  prefs.putUChar("jig_dist", jiggleCfg.distance);
+  prefs.end();
+}
+
+// Called from loop() on every pass, also while the setup hotspot is open. Moves out,
+// and back 80 ms later, so the pointer ends where it started.
+static void serviceJiggler() {
+#ifdef BUDDY_HID_MOUSE
+  const uint32_t now = millis();
+  if (jiggleOut) {
+    if ((int32_t)(now - jiggleBackMs) >= 0) { hidMouseMove(-jiggleLast.dx, -jiggleLast.dy); jiggleOut = false; }
+    return;
+  }
+  if (!jiggleCfg.enabled || (int32_t)(now - jiggleNextMs) < 0) return;
+  jiggleLast = jiggleMove(jiggleCfg, jiggleFlip, esp_random(), esp_random());
+  hidMouseMove(jiggleLast.dx, jiggleLast.dy);
+  jiggleOut = true;
+  jiggleBackMs = now + 80;
+  jiggleSchedule();
+#endif
+}
+
+void drawJiggle() {
+  const bool on = jiggleCfg.enabled;
+  gfx->fillScreen(on ? rgb(67,147,143) : rgb(70,70,70));
+  centeredTextColor("MOUSE JIGGLER", 8, 2, rgb(255,255,255));
+  centeredTextColor(on ? "ON" : "OFF", 38, 8, rgb(255,255,255));
+  char line[40];
+  snprintf(line, sizeof(line), "%s  EVERY %u S  %u PX", jiggleCfg.mode == JIGGLE_STEADY ? "STEADY" : "RANDOM",
+           (unsigned)jiggleCfg.intervalS, (unsigned)jiggleCfg.distance);
+  centeredTextColor(line, 112, 2, rgb(255,255,255));
+  centeredTextColor("TAP TO TURN ON OR OFF", 142, 1, rgb(230,230,230));
+  drawPageDots();
+}
+
+// ── "AI agent is running" page (a screen saver) ───────────
+// For the times an AI agent is working on the computer and nobody should touch it. The
+// text drifts slowly so no pixel stays lit, and a green dot pulses. Whether the page exists
+// is a setting (@MB AGENT, the desktop app's Status page), kept in NVS, off by default.
+static void agentLoad() {
+  Preferences prefs;
+  prefs.begin("buddy", true);
+  agentShow = prefs.getBool("agent_show", false);
+  agentPin  = prefs.getBool("agent_pin", false);
+  String text = prefs.getString("agent_text", AGENT_TEXT_DEFAULT);
+  prefs.end();
+  if (text.length() >= 1 && text.length() < sizeof(agentText)) strlcpy(agentText, text.c_str(), sizeof(agentText));
+}
+
+static void agentSave() {
+  Preferences prefs;
+  prefs.begin("buddy", false);
+  prefs.putBool("agent_show", agentShow);
+  prefs.putBool("agent_pin", agentPin);
+  prefs.putString("agent_text", agentText);
+  prefs.end();
+}
+
+// Goes to the agent page now (it is the AI section's first page). Used when it gets pinned,
+// and at boot, so a pinned Buddy starts on it.
+static void showAgentPage() {
+  if (!agentShow) return;
+  sectionLastApp[currentSection] = currentApp;
+  currentSection = SEC_AI;
+  currentPageIdx = 0;
+  buildPageList();
+  nextAutoPage = millis() + PAGE_AUTO_INTERVAL_MS;
+}
+
+void drawAgent() {
+  gfx->fillScreen(rgb(0, 0, 0));
+  const float t = (float)millis();
+  // The block is as wide as its widest line (the two big ones are 192 and 240 px; the text
+  // is 12 px a letter); it drifts across whatever room is left on the screen.
+  const int blockW = max(240, (int)strlen(agentText) * 12);
+  const int room = max(0, SCREEN_W - 8 - blockW);
+  const int x = 4 + (int)((float)room * 0.5f * (1.0f + sinf(t / 9000.0f)));
+  const int y = 4 + (int)(20.0f * (1.0f + sinf(t / 7000.0f + 1.3f)));    // and 4..44
+  const float pulse = 0.5f + 0.5f * sinf(t / 450.0f);
+  gfx->fillCircle(x + 7, y + 7, 6, rgb(0, 90 + (int)(150.0f * pulse), 60));
+  gfx->setTextSize(2); gfx->setTextColor(rgb(67,147,143));
+  gfx->setCursor(x + 22, y); gfx->print("WORKING");
+  gfx->setTextSize(4); gfx->setTextColor(rgb(255,255,255));
+  gfx->setCursor(x, y + 24); gfx->print("AI AGENT");
+  gfx->setTextColor(rgb(246,194,74));
+  gfx->setCursor(x, y + 58); gfx->print("IS RUNNING");
+  gfx->setTextSize(2); gfx->setTextColor(rgb(255,255,255));
+  gfx->setCursor(x, y + 98); gfx->print(agentText);
   drawPageDots();
 }
 
@@ -2279,6 +2507,7 @@ void mbInfo() {
   JsonDocument doc;
   doc["fw"]    = FW_VERSION;
   doc["cfg_v"] = CONFIG_VERSION;
+  doc["jiggler"] = JIGGLE_SUPPORTED;     // this firmware can be a USB mouse (esp32-s3-hid)
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
   char macStr[18];
@@ -2380,6 +2609,133 @@ void mbStatus(JsonDocument &body) {
   mbReply(true, fields);
 }
 
+// The desktop app fetches the network pages' numbers and pushes them over USB, so
+// those pages work with no Wi-Fi. Each is stored like a fetch result (and replaced
+// by the next one, from either source). Pages that are hidden until they have data
+// (Stock without a key, GitHub without a user) appear with the first push.
+// WEATHER {"temp","humidity","wind","code","is_day"}
+void mbWeather(JsonDocument &body) {
+  FeedWeather f;
+  const char *err;
+  if (!feedWeatherParse(body.as<JsonVariantConst>(), f, &err)) { mbError(err); return; }
+  WeatherData w = {};
+  w.temp = f.temp; w.humidity = f.humidity; w.wind = f.wind; w.code = f.code; w.isDay = f.isDay;
+  w.updatedAt = millis(); w.valid = true;
+  publishNetData(netShared.weather, w);
+  mbOk();
+}
+
+// STOCK {"symbol","price","open","high","low"}
+void mbStock(JsonDocument &body) {
+  FeedStock f;
+  const char *err;
+  if (!feedStockParse(body.as<JsonVariantConst>(), f, &err)) { mbError(err); return; }
+  const bool appears = !netShared.stock.valid && !stockConfigured();
+  StockData s = {};
+  s.price = f.price; s.open = f.open; s.high = f.high; s.low = f.low;
+  strlcpy(s.symbol, f.symbol, sizeof(s.symbol));
+  s.updatedAt = millis(); s.valid = true;
+  publishNetData(netShared.stock, s);
+  if (appears) rebuildPageListKeepPage();
+  mbOk();
+}
+
+// GITHUB {"followers","repos"}
+void mbGithub(JsonDocument &body) {
+  FeedGithub f;
+  const char *err;
+  if (!feedGithubParse(body.as<JsonVariantConst>(), f, &err)) { mbError(err); return; }
+  const bool appears = !netShared.github.valid && !githubConfigured();
+  GithubData g = {};
+  g.followers = f.followers; g.repos = f.repos;
+  g.updatedAt = millis(); g.valid = true;
+  publishNetData(netShared.github, g);
+  if (appears) rebuildPageListKeepPage();
+  mbOk();
+}
+
+// TIME {"epoch": <seconds since 1970 UTC>}: sets the clock when there is no NTP.
+// The time zone is the Buddy's own (settings.tzRule, applied at boot).
+void mbTime(JsonDocument &body) {
+  uint32_t epoch;
+  const char *err;
+  if (!feedTimeParse(body.as<JsonVariantConst>(), epoch, &err)) { mbError(err); return; }
+  struct timeval tv = {(time_t)epoch, 0};
+  settimeofday(&tv, nullptr);
+  time_t t = (time_t)epoch;
+  struct tm lt;
+  localtime_r(&t, &lt);
+  clockStartMillis  = millis();
+  clockStartSeconds = (uint32_t)lt.tm_hour * 3600UL + (uint32_t)lt.tm_min * 60UL + (uint32_t)lt.tm_sec;
+  clockStartDays    = daysFromCivil(lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+  ntpSynced     = true;               // NTP takes over again after its usual 6 h
+  lastNtpSyncMs = millis();
+  Serial.printf("clock set from the desktop app: %02d:%02d:%02d\n", lt.tm_hour, lt.tm_min, lt.tm_sec);
+  mbOk();
+}
+
+// JIGGLE {"enabled","mode","interval","distance"}, every key optional: changes what is
+// given, saves it, and replies with the settings now in force. With no body it only reads.
+void mbJiggle(JsonDocument &body) {
+  if (!JIGGLE_SUPPORTED) { mbError("the mouse jiggler needs the esp32-s3-hid firmware"); return; }
+  if (!body.isNull()) {
+    JiggleConfig next = jiggleCfg;
+    const char *err;
+    if (!jiggleParse(body.as<JsonVariantConst>(), next, &err)) { mbError(err); return; }
+    const bool changed = memcmp(&next, &jiggleCfg, sizeof(next)) != 0;
+    jiggleCfg = next;
+    if (changed) { jiggleSave(); jiggleSchedule(); }
+  }
+  JsonDocument f;
+  f["supported"] = true;
+  f["enabled"]   = jiggleCfg.enabled;
+  f["mode"]      = jiggleModeName(jiggleCfg.mode);
+  f["interval"]  = jiggleCfg.intervalS;
+  f["distance"]  = jiggleCfg.distance;
+  mbReply(true, f);
+}
+
+// AGENT {"show": true|false, "pin": true|false, "text": "..."}, each optional: puts the "AI agent
+// is running" page in the AI section or takes it out, pins it (the auto-scroll stays on it) and
+// sets its last line; saved. With no body it only
+// reads. Replies with {"show": ..., "pin": ..., "text": ...}.
+void mbAgent(JsonDocument &body) {
+  if (!body.isNull()) {
+    FeedAgent a;
+    const char *err;
+    if (!feedAgentParse(body.as<JsonVariantConst>(), a, &err)) { mbError(err); return; }
+    bool changed = false;
+    const bool wasPinned = agentShow && agentPin;
+    if (a.hasShow && a.show != agentShow) { agentShow = a.show; changed = true; }
+    if (a.hasPin && a.pin != agentPin) { agentPin = a.pin; changed = true; }
+    if (a.hasText) {
+      const char *want = a.text[0] ? a.text : AGENT_TEXT_DEFAULT;     // "" = the default again
+      if (strcmp(want, agentText) != 0) { strlcpy(agentText, want, sizeof(agentText)); changed = true; }
+    }
+    if (changed) {
+      agentSave();
+      rebuildPageListKeepPage();
+      if (agentShow && agentPin && !wasPinned) showAgentPage();     // pinning goes there at once
+    }
+  }
+  JsonDocument f;
+  f["show"] = agentShow;
+  f["pin"]  = agentPin;
+  f["text"] = (const char *)agentText;
+  mbReply(true, f);
+}
+
+// ROTATE: turns the screen 180° now (and saves it); {"mount":"left"|"right"} sets that side
+// instead of toggling. Replies with the side now in force.
+void mbRotate(JsonDocument &body) {
+  const char *want = body["mount"] | (const char *)nullptr;
+  if (want && strcmp(want, "left") && strcmp(want, "right")) { mbError("mount must be \"left\" or \"right\""); return; }
+  if (!want || (strcmp(want, "right") == 0) != settings.mountRight) rotateScreen();
+  JsonDocument f;
+  f["mount"] = settings.mountRight ? "right" : "left";
+  mbReply(true, f);
+}
+
 void serviceProtocol() {
   while (Serial.available() > 0) {
     LineReader::Result r = mbReader.feed((char)Serial.read());
@@ -2413,6 +2769,13 @@ void serviceProtocol() {
       case MB_DEFAULTS: mbDefaults(); break;
       case MB_USAGE:    mbUsage(body); break;
       case MB_STATUS:   mbStatus(body); break;
+      case MB_TIME:     mbTime(body); break;
+      case MB_WEATHER:  mbWeather(body); break;
+      case MB_STOCK:    mbStock(body); break;
+      case MB_GITHUB:   mbGithub(body); break;
+      case MB_JIGGLE:   mbJiggle(body); break;
+      case MB_ROTATE:   mbRotate(body); break;
+      case MB_AGENT:    mbAgent(body); break;
       default:          mbError("unknown command"); break;
     }
   }
@@ -2467,6 +2830,24 @@ void flushBrightnessSave(bool now) {
 
 // ── Interaction handlers ──────────────────────────────────
 
+// Turns the screen and the touch 180° at once and saves it, which is the same as switching
+// "Screen side" between left and right (settings.mountRight) but with no restart. Works
+// from a still hold of 1.2-2.4 s on the touch screen, and from @MB ROTATE.
+void rotateScreen() {
+  const bool right = !settings.mountRight;
+  Settings next = settings;
+  next.mountRight = right;
+  JsonDocument file;
+  settingsToJson(next, file.to<JsonObject>());
+  if (!writeJsonAtomic(CONFIG_PATH, file)) Serial.println("rotate: could not save, it will not survive a restart");
+  settings.mountRight = right;                  // rotated either way, so the next call turns it back
+  screenRotation = right ? 3 : 1;
+  tiltSign       = right ? -1.0f : 1.0f;
+  display->setRotation(screenRotation);
+  _touchRot      = screenRotation;
+  Serial.printf("Screen rotated: mounted on the %s\n", right ? "right" : "left");
+}
+
 void triggerDoubleTap() {
   autoPageEnabled = !autoPageEnabled;
   autoPageBannerUntil = millis() + 1400;
@@ -2496,6 +2877,11 @@ void triggerFaceTap() {
   } else if (currentApp == PAGE_STATUS) {
     statusState = (statusState + 1) % STATUS_COUNT;   // swipe still changes page
     Serial.printf("Status: %s\n", statusLabel(statusState));
+  } else if (currentApp == PAGE_JIGGLE) {
+    jiggleCfg.enabled = !jiggleCfg.enabled;
+    jiggleSave();
+    jiggleSchedule();
+    Serial.printf("Mouse jiggler: %s\n", jiggleCfg.enabled ? "on" : "off");
   } else {
     switchApp(1);
   }
@@ -2534,6 +2920,7 @@ void readTouch() {
       touchSwipeDone = false;
       touchWasDown = true;
       touchPortalArmed = true;   // this press is eligible to open the portal
+      touchEdgeDrag = x >= SCREEN_W - TOUCH_EDGE_PX;   // a vertical drag from this strip sets the brightness
       return;
     }
     // A page swipe already fired for this press: the rest of the contact is
@@ -2560,9 +2947,14 @@ void readTouch() {
       touchMoved = true;
       touchPortalArmed = false;
     } else if (abs(dy) > 55 && abs(dy) > abs(dx)+18) {
-      setBrightness((int)brightnessLevel + (dy < 0 ? 24 : -24));
-      // Re-base so a continued drag steps brightness again every 55 px.
-      touchStartX = x; touchStartY = y;
+      if (touchEdgeDrag) {
+        setBrightness((int)brightnessLevel + (dy < 0 ? 24 : -24));
+        // Re-base so a continued drag steps brightness again every 55 px.
+        touchStartX = x; touchStartY = y;
+      } else {
+        switchSection(dy < 0 ? 1 : -1);   // swipe up: the next section; down: the one before
+        touchSwipeDone = true;            // one section per swipe
+      }
       touchMoved = true;
       touchPortalArmed = false;
     }
@@ -2576,12 +2968,16 @@ void readTouch() {
     int16_t dy = (int16_t)touchLastY-(int16_t)touchStartY;
     if (pressMs >= 35 && pressMs <= 650 && !touchMoved && abs(dx) < 35 && abs(dy) < 35) {
       triggerFaceTap();
+    } else if (pressMs >= TOUCH_ROTATE_HOLD_MS && pressMs < TOUCH_PORTAL_HOLD_MS && !touchMoved
+               && abs(dx) < 35 && abs(dy) < 35) {
+      rotateScreen();                 // a deliberate still hold, lifted before the portal opens
     }
     touchWasDown = false;
     touchMissFrames = 0;
     touchMoved = false;
     touchSwipeDone = false;
     touchPortalArmed = false;
+    touchEdgeDrag = false;
   }
 }
 
@@ -2602,6 +2998,7 @@ void updateFaceTimers() {
 }
 
 void updateAutoPage() {
+  if (agentPin && currentApp == PAGE_AGENT) return;      // pinned: stay on the agent page
   if (autoPageEnabled && millis() > nextAutoPage) switchApp(1);
 }
 
@@ -2724,7 +3121,9 @@ void setup() {
   // its "line too long" reply instead of being truncated by the driver.
   // Both must be set before begin().
   Serial.setRxBufferSize(2 * LineReader::CAPACITY);
+#ifndef BUDDY_HID_MOUSE                  // USBCDC writes straight into TinyUSB's FIFO; mbReply() retries
   Serial.setTxBufferSize(LineReader::CAPACITY);
+#endif
   Serial.begin(115200);
   // Never wait on the USB serial. Once a serial monitor has read the port,
   // the core treats it as connected; when the monitor closes, every print
@@ -2732,6 +3131,18 @@ void setup() {
   // touch ignored) until the next reset. With no wait, output nobody reads
   // is simply dropped.
   Serial.setTxTimeoutMs(0);
+#ifdef BUDDY_HID_MOUSE
+  // The HID interface has to be added before USB.begin() enumerates the device.
+  USB.VID(0x303A);
+  USB.PID(0x4001);          // Espressif's TinyUSB id; the USB-Serial-JTAG one is 0x1001, which the
+                            // serial tools use to tell the two apart (they handle DTR differently)
+  USB.productName("Monitor Buddy");
+  USB.manufacturerName("Monitor-Buddy");
+  hidMouseBegin();
+  USB.begin();
+#endif
+  jiggleLoad();
+  agentLoad();
   delay(150);
   Serial.println(BOARD_NAME " Monitor-Buddy " FW_VERSION " starting");
   netMutex = xSemaphoreCreateMutex();
@@ -2779,6 +3190,7 @@ void setup() {
 
   // Build the enabled-page list from settings.pages.
   buildPageList();
+  if (agentShow && agentPin) showAgentPage();     // a pinned Buddy starts on its agent page
   // Seed the clock from the compile time as a safe fallback. syncNTP()
   // replaces it with the real time once Wi-Fi is up.
   clockStartMillis = millis();
@@ -2799,13 +3211,13 @@ void setup() {
   wifiManager.setAPClientCheck(true);            // don't close while a phone is joined
   wifiManager.setWebClientCheck(true);           // every HTTP request resets the timer
 
-  // ON_FAIL is the policy that matches "open the portal whenever the board
-  // cannot get onto Wi-Fi". It covers BOTH cases:
-  //   - no credentials stored yet  → connectToWiFi() returns false → portal
-  //   - credentials stored but the AP is gone / password wrong → portal
-  // (NO_CREDENTIALS_ONLY, the library default, would silently give up on a
-  // bad password, which is exactly the situation we need the portal for.)
-  wifiManager.setFallbackPolicy(AyresWiFiManager::FallbackPolicy::ON_FAIL);
+  // The portal opens by itself only when there are no credentials at all.
+  // With saved ones that fail (no Wi-Fi where the Buddy sits, router off) it
+  // would take over the whole screen and hide every page, so the Buddy runs
+  // offline instead and keeps retrying (setAutoReconnect / maintainWifi). A wrong
+  // password is fixed by holding the screen 3 s, or the BOOT button, or the
+  // desktop app's Setup page. (Before 1.2.x this was ON_FAIL.)
+  wifiManager.setFallbackPolicy(AyresWiFiManager::FallbackPolicy::NO_CREDENTIALS_ONLY);
   wifiManager.setAutoReconnect(true);
   wifiManager.enableButtonPortal(true);          // BOOT button 2–5 s opens portal
   wifiManager.setLedAuto(true);
@@ -2843,7 +3255,7 @@ void setup() {
   }
 
   // Blocks: up to 2 s button window, then up to 15 s connect attempt.
-  // On failure it opens the captive portal per the ON_FAIL policy above.
+  // With no saved network it opens the captive portal (see the policy above).
   wifiManager.run();
 
   if (wifiManager.isConnected()) {
@@ -2870,6 +3282,7 @@ void loop() {
   // The web flasher's serial protocol. First, so it also answers while the
   // setup hotspot is open.
   serviceProtocol();
+  serviceJiggler();
 
   // ── Captive-portal mode takes over the whole loop ───────
   // AWM must service DNS + HTTP promptly, and the network pages are
@@ -2894,6 +3307,17 @@ void loop() {
 
   // A touch-hold inside readTouch() may have just opened the portal.
   if (wifiManager.isPortalActive()) return;
+
+  // Pages that need numbers appear and disappear as Wi-Fi comes and goes and as numbers
+  // arrive: rebuild the current section's list when it would now be different.
+  static uint32_t lastListCheckMs = 0;
+  if (millis() - lastListCheckMs >= 500) {
+    lastListCheckMs = millis();
+    netWifiUp = !wifiManager.isPortalActive() && wifiManager.isConnected();
+    uint8_t now[APP_COUNT];
+    const uint8_t n = sectionPages(currentSection, now);
+    if (n != pageCount || memcmp(now, pageOrder, n) != 0) rebuildPageListKeepPage();
+  }
 
   updateAutoPage();
   updateFaceTimers();
@@ -2924,10 +3348,22 @@ void loop() {
     case 7: drawClaude();     break;
     case 8: drawCodex();      break;
     case 9: drawStatus();     break;
+    case 11: drawJiggle();    break;
+    case 12: drawAgent();     break;
     default: drawNetInfo();   break;
   }
-  // Brightness or auto-advance feedback banner — shown briefly after a gesture.
-  if (millis() < brightnessBannerUntil) {
+  // Section, brightness or auto-advance feedback banner — shown briefly after a gesture.
+  if (millis() < sectionBannerUntil) {
+    const char *msg = SECTION_NAMES[currentSection];
+    uint16_t bannerColor = rgb(246,194,74);
+    gfx->setTextSize(2);
+    gfx->setTextColor(bannerColor);
+    int bw = (int)strlen(msg)*12;
+    gfx->fillRoundRect((SCREEN_W-bw-20)/2, SCREEN_H/2-16, bw+20, 32, 6, BG);
+    gfx->drawRoundRect((SCREEN_W-bw-20)/2, SCREEN_H/2-16, bw+20, 32, 6, bannerColor);
+    gfx->setCursor((SCREEN_W-bw)/2, SCREEN_H/2-7);
+    gfx->print(msg);
+  } else if (millis() < brightnessBannerUntil) {
     char msg[20];
     snprintf(msg, sizeof(msg), "BRIGHTNESS %u%%", (unsigned)(brightnessLevel * 100UL / 255UL));
     uint16_t bannerColor = rgb(0,200,255);
